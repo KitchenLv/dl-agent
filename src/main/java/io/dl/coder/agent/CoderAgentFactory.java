@@ -3,8 +3,6 @@ package io.dl.coder.agent;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import io.agentscope.core.model.Model;
-import io.agentscope.core.permission.PermissionContextState;
-import io.agentscope.core.permission.PermissionMode;
 import io.agentscope.core.state.JsonFileAgentStateStore;
 import io.agentscope.core.tool.Toolkit;
 import io.agentscope.extensions.model.anthropic.AnthropicChatModel;
@@ -17,6 +15,7 @@ import io.agentscope.harness.agent.memory.compaction.ToolResultEvictionConfig;
 import io.dl.coder.config.AppConfig;
 import io.dl.coder.config.McpConfig;
 import io.dl.coder.config.ModelProvider;
+import io.dl.coder.permission.PermissionPolicy;
 import io.dl.coder.prompt.SystemPrompt;
 
 public class CoderAgentFactory {
@@ -38,15 +37,18 @@ public class CoderAgentFactory {
                 .compaction(CompactionConfig.builder().triggerMessages(40).keepMessages(15)
                         .flushBeforeCompact(true).build())
                 .toolResultEviction(ToolResultEvictionConfig.defaults()).toolkit(toolkit)
-                .maxIters(30)
-                .permissionContext(
-                        PermissionContextState.builder().mode(PermissionMode.DEFAULT).build())
+                .maxIters(50)
+                .permissionContext(PermissionPolicy.buildPermissionContext(projectDir))
                 .stateStore(new JsonFileAgentStateStore()).workspace(workspace);
         // 配置了 MCP server 时显式传入；为空则不传，保留 workspace tools.json 的默认加载路径
         if (mcp != null && !mcp.isEmpty()) {
             builder.toolsConfig(mcp.toToolsConfig());
         }
-        return builder.build();
+        HarnessAgent agent = builder.build();
+        // 内建工具在 build 时才注册进 agent 的 toolkit 副本，之后包上内容级规则匹配
+        // （rm -rf/git push → ASK，.env/.ssh → DENY 等，见 PermissionPolicy）
+        PermissionPolicy.harden(agent.getToolkit());
+        return agent;
     }
 
     private static Model buildModel(AppConfig config) {

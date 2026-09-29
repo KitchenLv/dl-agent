@@ -28,29 +28,26 @@
 
 ### P0 — 安全与核心闭环
 
-#### P0-1 接通 HITL 人工确认流
-- **现状**：`ConsoleRenderer` 收到 `REQUIRE_USER_CONFIRM` 只打印"当前 CLI 未接确认流，默认拒绝"。工具确认等于永远拒绝，M4 的 y/n 确认实际不存在。
-- **方案**：按技术设计 §5.10 —— 事件流收到 `RequireUserConfirmEvent` 后暂停，终端渲染待确认的工具调用与参数，`y/n/a`（a = 始终允许）输入后把 `List<ConfirmResult>` 放入下一条 `UserMessage.metadata`（`METADATA_CONFIRM_RESULTS` 键）恢复执行；"始终允许"规则随 AgentState 持久化。
-- **改动点**：`CoderCli`（确认交互 + metadata 透传）、`ConsoleRenderer`（确认 UI）。
-- **验收**：配置 `git push` 类 ASK 规则后，触发时终端弹确认，`y` 放行 / `n` 拒绝且 agent 收到拒绝结果 / `a` 后同类调用不再询问。
-- **预估**：1 天
+#### P0-1 接通 HITL 人工确认流 ✅（2026-09-29 完成）
+- **现状**：~~`ConsoleRenderer` 收到 `REQUIRE_USER_CONFIRM` 只打印"当前 CLI 未接确认流，默认拒绝"。~~ 已接通。
+- **实现**：`CoderCli.chat` 内循环——事件流在 `RequireUserConfirmEvent` 后结束，渲染待确认调用，逐个收集 `y/n/a`，把 `List<ConfirmResult>` 放入下一条 `UserMessage.metadata`（`METADATA_CONFIRM_RESULTS` 键）恢复执行，直到本轮不再产生确认（上限 20 轮防死循环）。
+- **与设计的偏差**：① 框架 2.0.2 每次调用都从 AgentState 重建 `PermissionEngine`，`ConfirmResult.rules` 只进当轮引擎——`CoderCli.persistAllowRules` 通过 `getDelegate().replacePermissionContext(...)` 把 "a" 规则读改写回会话 state，实现跨轮（含跨重启）持久化；② 2.0.2 的 `ConfirmResult` 无拒绝原因构造器，`n` 时模型看到默认 "Permission denied by user"。
+- **验收**：已实测（glm-5.3-flash，脚本化 REPL）：`git push` 弹确认，`n` 拒绝且 agent 收到拒绝结果；`a` 后同会话再次 `git status` 免确认直接执行。
 
-#### P0-2 权限规则装配（PermissionPolicy）
-- **现状**：`CoderAgentFactory` 仅 `PermissionContextState.builder().mode(PermissionMode.DEFAULT).build()`，无任何规则。
-- **方案**：新建 `permission/PermissionPolicy`，按技术设计 §5.10 装配：`dangerous-shell`（`rm -rf|git push|mvn deploy` → ASK）、`no-secrets`（`.env|.ssh/|credentials` → DENY）、`AdditionalWorkingDirectory` 绑定项目根。
-- **验收**：单元测试覆盖规则匹配（命中/不命中/优先级）；`rm -rf` 触发确认，读 `.env` 被拒。
-- **预估**：0.5 天
+#### P0-2 权限规则装配（PermissionPolicy）✅（2026-09-29 完成）
+- **实现**：新建 `permission/` 包：
+  - `PermissionPolicy.buildPermissionContext(projectDir)`：no-secrets（`.env|.ssh/|credentials|id_rsa|*.pem` → DENY，作用于 read/write/edit/grep）、dangerous-shell（`rm -r*|rm -f*|git push|git reset --hard|mvn deploy` → ASK）、只读与工作区工具 → 工具级 ALLOW、项目根 `AdditionalWorkingDirectory`。
+  - `GuardedTool`：包装 harness 内建工具，补上注解式工具缺失的 `matchRule`（ruleContent 按正则匹配 command/path 参数）与内容级 `generateSuggestions`（"a" 精确到本次命令文本，不放行整个工具）。
+- **与设计的偏差**：技术设计 §5.10 的 `ruleContent` 直接写规则即可用的前提不成立——框架注解式工具未覆写 `matchRule`，非空 ruleContent 永不命中，故需 `GuardedTool` 包装（在 `HarnessAgent.build()` 后经 `agent.getToolkit()` 替换注册）。
+- **验收**：`PermissionPolicyTest` 10 例全过（命中/不命中/DENY>ASK>ALLOW 优先级/建议规则精度/包装幂等）；实测 `read_file .env` 被规则直接 DENIED、`list_files`/`glob_files` 免确认。
+- **已知边界**：grep_files 的 DENY 只拦显式指向敏感文件的 path，整目录 grep 可能带出片段。
 
-#### P0-3 设置 `maxIters`
-- **现状**：factory 未调 `.maxIters()`，框架默认 10，复杂 coding 任务会被提前截断。
-- **方案**：`.maxIters(50)`（技术设计 §5.1），并渲染 `EXCEED_MAX_ITERS` 警告（已支持）。
-- **预估**：10 分钟
+#### P0-3 设置 `maxIters` ✅（2026-09-29 完成）
+- **实现**：`.maxIters(50)`（原为 30，非框架默认 10）；`EXCEED_MAX_ITERS` 警告渲染已支持。
 
-#### P0-4 `web_fetch` 工具核查
-- **现状**：`SystemPrompt` 告诉模型"用 `web_fetch` 抓网页"，但项目无 `tools/` 包、未注册自定义工具。若 Harness 未内建该工具，模型会调用不存在的工具。
-- **方案**：先验证框架内建清单；无则按技术设计 §5.4 实现 `WebFetchTool`（注解式，8K 截断，`readOnly=true`）；有则删提示词条目。
-- **验收**：让 agent "抓取某 URL 并总结"，实际调用成功。
-- **预估**：0.5 天
+#### P0-4 `web_fetch` 工具核查 ✅（2026-09-29 完成，无需改码）
+- **结论**：`web_fetch`/`web_search` 为 harness 内建（`WebTools`，`disableWebTools` 默认 false 即默认注册），`SystemPrompt` 提示词条目准确，无需实现自定义工具。
+- **验收**：源码核验通过（`HarnessAgent` build 流程 2738-2746 行注册）；抓取真实 URL 的端到端演示留待日常使用验证。
 
 ### P1 — M5 收尾与交互
 
@@ -112,7 +109,7 @@
 
 | 批次 | 内容 | 预估 | 出口标准 |
 |---|---|---|---|
-| **第一批（安全闭环）** | P2-5 安全整改 + git 基线 → P0-3 maxIters → P0-2 权限规则 → P0-1 确认流 → P0-4 web_fetch | ~2.5 天 | `git push`/`rm -rf` 弹 y/n 且 `a` 可持久放行；读 `.env` 被拒；50 轮迭代不截断 |
+| **第一批（安全闭环）** | ✅ P0-3 maxIters → ✅ P0-2 权限规则 → ✅ P0-1 确认流 → ✅ P0-4 web_fetch 核查（2026-09-29，出口标准全过）；⬜ P2-5 安全整改 + git 基线仍待办 | ~2.5 天 | `git push`/`rm -rf` 弹 y/n 且 `a` 可持久放行；读 `.env` 被拒；50 轮迭代不截断 |
 | **第二批（M5 收尾）** | P1-1 命令补全 → P1-2 token 统计 → P1-3 MCP 实测 → P1-4 ollama/dashscope | ~2.5 天 | PRD M5 验收脚本全过：MCP 真实调用成功、`/model` 即时生效、`/stats` 出 token 数 |
 | **第三批（质量与增强）** | P2-1 测试 → P1-5 渲染/中断 → P2-2 模板 → P2-3 子代理 →（可选）P2-4 沙箱 | ~3~4 天 | 关键路径有测试护栏；子代理演示可跑 |
 

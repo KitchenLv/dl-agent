@@ -108,8 +108,9 @@ public class ConsoleRenderer {
                 out.println(color(YELLOW, "  ⚠ 达到最大迭代次数，本轮提前结束"));
             }
             case REQUIRE_USER_CONFIRM -> {
+                // 待确认调用与 y/n/a 交互由 CoderCli 在事件流结束后统一处理
                 newlineIfPrinting();
-                out.println(color(YELLOW, "  ⚠ 工具请求人工确认（当前 CLI 未接确认流，默认拒绝）"));
+                out.println(color(YELLOW, "  ⏸ 工具请求人工确认，等待用户决定…"));
             }
             case AGENT_END -> {
                 if (printedTextThisTurn) {
