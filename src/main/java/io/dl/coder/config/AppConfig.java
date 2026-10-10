@@ -98,8 +98,13 @@ public class AppConfig {
             model.setApiKey(System.getenv(provider.apiKeyEnvVar()));
         }
         if (model.getApiKey() == null || model.getApiKey().isBlank()) {
-            throw new ConfigException(
-                    "缺少 API Key: 请在配置文件中设置 model.apiKey，" + "或设置环境变量 " + provider.apiKeyEnvVar());
+            if (provider.apiKeyOptional()) {
+                // ollama 等本地服务不校验 key，OpenAI 客户端又要求非空，填占位符
+                model.setApiKey("ollama");
+            } else {
+                throw new ConfigException(
+                        "缺少 API Key: 请在配置文件中设置 model.apiKey，" + "或设置环境变量 " + provider.apiKeyEnvVar());
+            }
         }
     }
 

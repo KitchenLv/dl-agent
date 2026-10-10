@@ -21,9 +21,17 @@ import io.dl.coder.prompt.SystemPrompt;
 public class CoderAgentFactory {
 
     public static HarnessAgent createAgent(Path workspace, Toolkit toolkit) {
-        AppConfig config = AppConfig.load();
+        return createAgent(workspace, toolkit, AppConfig.load(),
+                Paths.get(System.getProperty("user.dir")).toAbsolutePath().normalize());
+    }
+
+    /**
+     * 供 /model、/cd 等需要重建 agent 的命令复用：显式传入配置与项目根， 其余装配与默认路径一致。
+     * 会话状态按 (userId, sessionId) 存在 stateStore 里，重建后同一会话继续可用。
+     */
+    public static HarnessAgent createAgent(Path workspace, Toolkit toolkit, AppConfig config,
+            Path projectDir) {
         McpConfig mcp = config.getMcp();
-        Path projectDir = Paths.get(System.getProperty("user.dir")).toAbsolutePath().normalize();
         var builder = HarnessAgent.builder().model(buildModel(config)).name("coder-agent")
                 .sysPrompt(SystemPrompt.build(projectDir))
                 .filesystem(new LocalFilesystemSpec()
@@ -63,11 +71,14 @@ public class CoderAgentFactory {
                 }
                 return builder.build();
             }
-            case OPENAI: {
+            case OPENAI, OLLAMA, DASHSCOPE: {
+                // ollama / dashscope 走 OpenAI 兼容端点；baseUrl 未配置时用厂商默认
                 var builder = OpenAIChatModel.builder().apiKey(model.getApiKey())
                         .modelName(model.getName());
-                if (model.getBaseUrl() != null) {
-                    builder.baseUrl(model.getBaseUrl());
+                String baseUrl =
+                        model.getBaseUrl() != null ? model.getBaseUrl() : provider.defaultCompatibleBaseUrl();
+                if (baseUrl != null) {
+                    builder.baseUrl(baseUrl);
                 }
                 return builder.build();
             }

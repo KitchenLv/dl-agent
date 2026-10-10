@@ -18,17 +18,22 @@ import io.agentscope.harness.agent.HarnessAgent;
 import io.dl.coder.agent.CoderAgentFactory;
 import io.dl.coder.config.AppConfig;
 import io.dl.coder.config.McpConfig;
+import io.dl.coder.workspace.WorkspaceInitializer;
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.PrintStream;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 /**
  * 交互式 REPL 入口。
@@ -38,30 +43,48 @@ import java.util.concurrent.atomic.AtomicReference;
  * 自动持久化并恢复各自的对话状态， 同会话串行、不同会话互不串扰。切换会话只是换一个 sessionId，无需重建 agent。
  *
  * <p>
+ * 斜杠命令经注册表分发（{@link #register}）；{@code /model}、{@code /cd} 会重建 agent 实例—— 会话状态存在
+ * stateStore 里按 (userId, sessionId) 恢复，重建不丢上下文。
+ *
+ * <p>
  * 用法：mvn exec:java -Dexec.mainClass=io.dl.coder.cli.CoderCli
  */
-public class CoderCli {
+public class CoderCli implements AutoCloseable {
 
     private static final String USER_ID = "dev";
     /** 单轮对话内人工确认的最大轮数，防确认-拒绝-再确认死循环。 */
     private static final int MAX_CONFIRM_ROUNDS = 20;
+    /** /memory 展示 MEMORY.md 的尾部行数。 */
+    private static final int MEMORY_TAIL_LINES = 30;
     private static final String BANNER = """
             ╭──────────────────────────────╮
             │  DL Coder  ·  AgentScope CLI │
             ╰──────────────────────────────╯""";
 
-    private final HarnessAgent agent;
+    private final PrintStream out;
+    private final BufferedReader in;
     private final ConsoleRenderer renderer;
     private final SessionManager sessions;
     private final McpConfig mcp;
-    private final PrintStream out;
-    private final BufferedReader in;
+    private final AppConfig config;
+    private final Path workspace;
+    /** 命令注册表（保持注册顺序，/help 按此生成） */
+    private final Map<String, SlashCommand> commands = new LinkedHashMap<>();
+    private final Map<String, String> helps = new LinkedHashMap<>();
 
     private String currentSession = SessionManager.DEFAULT_SESSION;
+    /** 项目根：execute 的 cwd、代码落点；/cd 可变，变更后重建 agent。 */
+    private Path projectDir;
+    /** 可变：/model、/cd 重建。会话状态在 stateStore，不随实例销毁。 */
+    private HarnessAgent agent;
 
-    public CoderCli(HarnessAgent agent, McpConfig mcp) {
+    public CoderCli(HarnessAgent agent, McpConfig mcp, AppConfig config, Path workspace,
+            Path projectDir) {
         this.agent = agent;
         this.mcp = mcp;
+        this.config = config;
+        this.workspace = workspace;
+        this.projectDir = projectDir;
         // 编码跟随控制台（JDK 18+ 的 System.out.charset() 在控制台上返回其代码页，
         // 如 Windows GBK 936）。不要强制 UTF-8：控制台仍是 GBK 时中文会乱码。
         // 想要完整 UTF-8 体验，可先执行 chcp 65001 再启动。
@@ -71,16 +94,34 @@ public class CoderCli {
         this.renderer = new ConsoleRenderer(this.out);
         this.sessions = SessionManager.createDefault();
         this.sessions.register(currentSession);
+        registerCommands();
     }
 
     public static void main(String[] args) throws IOException {
         Path workspace = Path.of(System.getProperty("user.home"), ".dl-coder", "workspace");
         // 框架不会替我们创建工作区目录；缺目录时文件工具会 "Path does not exist"
-        java.nio.file.Files.createDirectories(workspace);
+        Files.createDirectories(workspace);
+        // 首启补齐 AGENTS.md / 技能 / 子代理模板（已存在的不覆盖）
+        List<String> created = WorkspaceInitializer.initialize(workspace);
+        if (!created.isEmpty()) {
+            System.out.println("首次启动，已初始化工作区模板: " + String.join(", ", created));
+        }
         AppConfig config = AppConfig.load();
+        Path projectDir = Path.of(System.getProperty("user.dir")).toAbsolutePath().normalize();
         HarnessAgent agent = CoderAgentFactory.createAgent(workspace, new Toolkit());
-        try (agent) {
-            new CoderCli(agent, config.getMcp()).run();
+        try (CoderCli cli = new CoderCli(agent, config.getMcp(), config, workspace, projectDir)) {
+            cli.run();
+        }
+        // MCP stdio 子进程的读线程与 Reactor 调度器是非守护线程，2.0.2 的 close() 不终止它们，
+        // 正常返回后 JVM 仍挂着——CLI 场景直接强制退出
+        System.exit(0);
+    }
+
+    @Override
+    public void close() {
+        // agent 可能已被 /model、/cd 换成新实例，关闭当前那个
+        if (agent != null) {
+            agent.close();
         }
     }
 
@@ -104,8 +145,9 @@ public class CoderCli {
             }
             try {
                 if (input.startsWith("/")) {
-                    if (!handleCommand(input)) {
-                        return; // /exit
+                    if (!dispatch(input)) {
+                        out.println("再见。");
+                        return;
                     }
                 } else {
                     chat(input);
@@ -115,6 +157,59 @@ public class CoderCli {
             }
         }
         out.println("再见。");
+    }
+
+    // -----------------------------------------------------------------
+    // 命令注册与分发
+    // -----------------------------------------------------------------
+
+    private void register(String name, String help, SlashCommand command) {
+        commands.put(name, command);
+        helps.put(name, help);
+    }
+
+    private void registerCommands() {
+        register("/exit", "/exit                       退出（等同 /quit）", args -> false);
+        register("/quit", "/quit                       退出", args -> false);
+        register("/help", "/help                       查看可用命令", args -> {
+            printHelp();
+            return true;
+        });
+        register("/session", "/session [list|new|switch] 会话管理", this::session);
+        register("/plan", "/plan on|off|status         计划模式（只读调研 → 人确认 → 执行）", this::plan);
+        register("/perm", "/perm [mode]                权限模式（default|explore|accept-edits|dont-ask）",
+                this::perm);
+        register("/model", "/model [name]               查看/热切换模型（重建 agent，下一轮生效）", this::model);
+        register("/cd", "/cd [path]                  查看/切换项目根（重建 agent，execute 的 cwd 跟随）",
+                this::cd);
+        register("/memory", "/memory                      查看 MEMORY.md 尾部", this::memory);
+        register("/skills", "/skills                      列出工作区技能", this::skills);
+        register("/mcp", "/mcp                        查看 MCP 服务器", args -> {
+            out.println(mcp == null || mcp.isEmpty() ? "未配置 MCP 服务器（config.json 的 mcp 段）"
+                    : "MCP 服务器:\n" + mcp.summary());
+            return true;
+        });
+        register("/stats", "/stats                      本进程用量统计（含 token）",
+                args -> {
+                    out.println(renderer.stats());
+                    return true;
+                });
+    }
+
+    /** @return false 表示退出 REPL */
+    private boolean dispatch(String input) {
+        String[] parts = input.split("\\s+");
+        SlashCommand command = commands.get(parts[0].toLowerCase());
+        if (command == null) {
+            out.println("未知命令 " + parts[0] + "，/help 查看可用命令");
+            return true;
+        }
+        return command.execute(parts);
+    }
+
+    private void printHelp() {
+        out.println("命令:");
+        helps.values().forEach(out::println);
     }
 
     // -----------------------------------------------------------------
@@ -262,51 +357,15 @@ public class CoderCli {
     }
 
     // -----------------------------------------------------------------
-    // 斜杠命令
+    // 各命令实现
     // -----------------------------------------------------------------
 
-    /** @return false 表示退出 REPL */
-    private boolean handleCommand(String input) {
-        String[] parts = input.split("\\s+");
-        String cmd = parts[0].toLowerCase();
-        switch (cmd) {
-            case "/exit", "/quit" -> {
-                return false;
-            }
-            case "/help" -> printHelp();
-            case "/session" -> session(parts);
-            case "/plan" -> plan(parts);
-            case "/perm" -> perm(parts);
-            case "/mcp" -> {
-                out.println(mcp == null || mcp.isEmpty() ? "未配置 MCP 服务器（config.json 的 mcp 段）"
-                        : "MCP 服务器:\n" + mcp.summary());
-            }
-            case "/stats" -> out.println(renderer.stats());
-            default -> out.println("未知命令 " + cmd + "，/help 查看可用命令");
-        }
-        return true;
-    }
-
-    private void printHelp() {
-        out.println("""
-                命令:
-                  /session                    查看当前会话
-                  /session list               列出全部会话
-                  /session new <名字>          新建并切换
-                  /session switch <名字>       切换（不存在则创建）
-                  /plan on|off|status         计划模式（只读调研 → 人确认 → 执行）
-                  /perm default|explore|accept-edits|dont-ask   权限模式
-                  /mcp                        查看 MCP 服务器
-                  /stats                      本进程用量统计
-                  /exit                       退出""");
-    }
-
-    private void session(String[] parts) {
+    private boolean session(String[] parts) {
         RuntimeContext ctx = currentContext();
         if (parts.length == 1) {
             out.println("当前会话: " + currentSession + "（plan mode: "
                     + (agent.isPlanModeActive(ctx) ? "开" : "关") + "）");
-            return;
+            return true;
         }
         switch (parts[1]) {
             case "list" -> {
@@ -329,13 +388,14 @@ public class CoderCli {
             }
             default -> out.println("用法: /session [list|new <名字>|switch <名字>]");
         }
+        return true;
     }
 
-    private void plan(String[] parts) {
+    private boolean plan(String[] parts) {
         RuntimeContext ctx = currentContext();
         if (parts.length < 2 || parts[1].equals("status")) {
             out.println("计划模式: " + (agent.isPlanModeActive(ctx) ? "开" : "关"));
-            return;
+            return true;
         }
         switch (parts[1]) {
             case "on" -> {
@@ -348,13 +408,14 @@ public class CoderCli {
             }
             default -> out.println("用法: /plan on|off|status");
         }
+        return true;
     }
 
-    private void perm(String[] parts) {
+    private boolean perm(String[] parts) {
         if (parts.length < 2) {
             out.println("当前权限模式: " + agent.getPermissionMode(USER_ID, currentSession));
             out.println("可选: default | explore | accept-edits | dont-ask");
-            return;
+            return true;
         }
         PermissionMode mode = switch (parts[1]) {
             case "default" -> PermissionMode.DEFAULT;
@@ -365,15 +426,101 @@ public class CoderCli {
         };
         if (mode == null) {
             out.println("未知模式: " + parts[1] + "（可选 default | explore | accept-edits | dont-ask）");
-            return;
+            return true;
         }
         agent.setPermissionMode(currentContext(), mode);
         out.println("权限模式已切换: " + parts[1]);
+        return true;
+    }
+
+    /** /model：无参显示当前模型；带参热切换（改内存配置 + 重建 agent，不落盘）。 */
+    private boolean model(String[] parts) {
+        if (parts.length < 2) {
+            out.println("当前模型: " + config.getProviderEnum().toString().toLowerCase() + "/"
+                    + config.getModel().getName());
+            out.println("切换: /model <模型名>（如 /model glm-5.3-flash；仅本轮进程生效，不写回 config.json）");
+            return true;
+        }
+        String name = parts[1];
+        config.getModel().setName(name);
+        rebuildAgent();
+        out.println("已切换模型 → " + config.getProviderEnum().toString().toLowerCase() + "/" + name
+                + "（下一轮生效，会话上下文保留）");
+        return true;
+    }
+
+    /** /cd：无参显示项目根；带参切换（重建 agent，execute 的 cwd 跟随）。 */
+    private boolean cd(String[] parts) {
+        if (parts.length < 2) {
+            out.println("当前项目根: " + projectDir);
+            return true;
+        }
+        Path target = Path.of(parts[1]).toAbsolutePath().normalize();
+        if (!Files.isDirectory(target)) {
+            out.println("目录不存在: " + target);
+            return true;
+        }
+        projectDir = target;
+        rebuildAgent();
+        out.println("项目根已切换 → " + projectDir + "（execute 的 cwd 与文件边界跟随，会话上下文保留）");
+        return true;
+    }
+
+    /** /memory：打印工作区 MEMORY.md 的尾部（长期记忆的最近条目）。 */
+    private boolean memory(String[] parts) {
+        Path file = workspace.resolve("MEMORY.md");
+        if (!Files.isRegularFile(file)) {
+            out.println("尚无 MEMORY.md（工作区: " + workspace + "）。agent 通过 memory_save 工具写入后这里可查看。");
+            return true;
+        }
+        try {
+            List<String> lines = Files.readAllLines(file);
+            int from = Math.max(0, lines.size() - MEMORY_TAIL_LINES);
+            out.println("── MEMORY.md 尾部 " + (lines.size() - from) + "/" + lines.size() + " 行 ──");
+            for (int i = from; i < lines.size(); i++) {
+                out.println(lines.get(i));
+            }
+        } catch (IOException e) {
+            out.println("读取失败: " + e.getMessage());
+        }
+        return true;
+    }
+
+    /** /skills：列出工作区 skills/ 下的技能目录。 */
+    private boolean skills(String[] parts) {
+        Path dir = workspace.resolve("skills");
+        if (!Files.isDirectory(dir)) {
+            out.println("尚无技能目录（" + dir + "）。放入 skills/<名字>/SKILL.md 即可被 agent 发现。");
+            return true;
+        }
+        try (Stream<Path> entries = Files.list(dir)) {
+            List<String> names = entries.filter(Files::isDirectory)
+                    .map(p -> p.getFileName().toString())
+                    .sorted()
+                    .collect(Collectors.toList());
+            if (names.isEmpty()) {
+                out.println("skills/ 为空。放入 skills/<名字>/SKILL.md 即可被 agent 发现。");
+            } else {
+                out.println("技能: " + String.join(", ", names));
+            }
+        } catch (IOException e) {
+            out.println("读取失败: " + e.getMessage());
+        }
+        return true;
     }
 
     // -----------------------------------------------------------------
     // 辅助
     // -----------------------------------------------------------------
+
+    /** 按当前配置与项目根重建 agent（/model、/cd 用）。旧实例关闭，会话状态在 stateStore 不受影响。 */
+    private void rebuildAgent() {
+        HarnessAgent old = this.agent;
+        this.agent = CoderAgentFactory.createAgent(workspace, new Toolkit(), config, projectDir);
+        if (old != null) {
+            old.close();
+        }
+    }
 
     private RuntimeContext currentContext() {
         return RuntimeContext.builder().userId(USER_ID).sessionId(currentSession).build();
@@ -387,7 +534,7 @@ public class CoderCli {
 
     private void printBanner() {
         out.println(BANNER);
-        out.println("工作区: ~/.dl-coder/workspace   输入 /help 查看命令");
+        out.println("工作区: ~/.dl-coder/workspace   项目根: " + projectDir + "   输入 /help 查看命令");
         if (mcp != null && !mcp.isEmpty()) {
             out.println("MCP:\n" + mcp.summary());
         }

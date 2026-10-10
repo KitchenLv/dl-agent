@@ -31,7 +31,9 @@
         <dependency>
             <groupId>com.fasterxml.jackson.core</groupId>
             <artifactId>jackson-databind</artifactId>
-            <version>2.17.2</version>
+            <!-- 与 harness 传递依赖(jackson-dataformat-yaml 2.21.x)对齐；钉 2.17 会导致
+                 子代理 frontmatter 解析时 YAMLParser 与 jackson-core 方法签名不匹配 -->
+            <version>2.21.1</version>
         </dependency>
 
         <dependency>

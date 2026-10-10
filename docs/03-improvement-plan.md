@@ -51,57 +51,55 @@
 
 ### P1 — M5 收尾与交互
 
-#### P1-1 斜杠命令补全：`/model` `/cd` `/memory` `/skills`
-- **方案**：按技术设计 §5.3 —— `/model <id>` 热切换（重建 agent 实例）、`/cd <path>` 切项目根（重建 agent）、`/memory` 打印 MEMORY.md 尾部、`/skills` 列出 workspace `skills/`。命令分发抽成 `SlashCommand` 类（对齐技术设计 §4 结构）。
-- **验收**：`/model` 切换后下一轮生效；`/cd` 后 `execute` 的 cwd 跟随变化。
-- **预估**：1 天
+#### P1-1 斜杠命令补全：`/model` `/cd` `/memory` `/skills` ✅（2026-10-08 完成）
+- **实现**：命令分发抽成 `SlashCommand` 接口 + `CoderCli` 内注册表（`/help` 自动生成）；新增四命令——`/model [name]` 热切换（改内存配置 + 重建 agent，不落盘）、`/cd [path]` 切项目根（校验目录存在 + 重建，execute 的 cwd 与文件边界跟随）、`/memory` 打印 workspace MEMORY.md 尾部 30 行、`/skills` 列出 workspace skills/ 技能目录。`CoderAgentFactory` 增加显式传 config/projectDir 的重载供重建复用；会话状态在 stateStore 按 (userId, sessionId) 恢复，重建不丢上下文。
+- **验收**：实测 `/model glm-5.3-flash` 切换后对话正常、`/cd` 切 docs 后 execute 边界跟随、重建后对话正常（"只回复两个字：收到"→ 正常回复）。
 
-#### P1-2 `/stats` 增加 token 用量
-- **方案**：从模型事件流累计 input/output token（`MODEL_CALL_END` 或用量事件），区分本轮/累计，替换现在"字符数"口径。
-- **预估**：0.5 天
+#### P1-2 `/stats` 增加 token 用量 ✅（2026-10-08 完成，机制就绪）
+- **实现**：`ConsoleRenderer` 消费 `MODEL_CALL_END.getUsage()`（`ChatUsage`），本轮（endTurn 暗色行 `↑in ↓out tokens`）与进程累计（`/stats`）双口径，字符数保留。
+- **已知边界**：当前 anthropic 兼容网关（bigmodel）流式响应不回传 usage，实测显示 `↑0 ↓0`；机制正确，数值取决于网关是否返回。
 
-#### P1-3 MCP 端到端实测
-- **现状**：`McpConfig`（含 `${ENV}` 展开、stdio/sse/http 三种 transport）与 `toolsConfig` 注入已完成，但从未连过真实 server。
-- **方案**：接一个真实 MCP server（如 filesystem/stdio 或 github/http），验证工具注册命名 `mcp__{server}__{tool}`、调用成功、失败时的报错可读性；问题记录回本计划。
-- **预估**：0.5 天
+#### P1-3 MCP 端到端实测 ✅（2026-10-08 完成，含两个修复）
+- **实测**：`@modelcontextprotocol/server-filesystem`（stdio）接入成功，`list_directory {"path":...} → SUCCESS` 返回真实目录内容。
+- **修复 ①**：Windows 下 stdio 的 `command: npx` 拉不起进程（ProcessBuilder 不解析 `.cmd`），且框架注册失败只打 SLF4J 日志（本项目无 provider → 静默失败）——`McpConfig` 对无扩展名的裸命令名在 PATH 上找 `xxx.cmd`，找到则补全。
+- **修复 ②**：`/exit` 后 JVM 挂住（MCP stdio 读线程非守护线程，2.0.2 的 `close()` 不终止）——`main` 末尾 `System.exit(0)`。
+- **与文档的偏差**：工具注册名是**原名**（如 `list_directory`），不是技术设计说的 `mcp__{server}__{tool}` 前缀；且与内建工具同名时直接覆盖注册表（`read_file` 等会被 server 版本替换）。
+- **遗留观察**：模型偶尔会"以为"自己没有 MCP 工具（实测第一轮自述无 fs 工具，强制提示后调用成功）——提示词/工具描述层面的问题，不阻断使用。
 
-#### P1-4 模型厂商扩展：ollama / dashscope
-- **方案**：`ModelProvider` 增加 `OLLAMA`、`DASHSCOPE`；factory 的 `buildModel` 增加分支（ollama 走 OpenAI 兼容 baseUrl 或官方扩展）。ollama 本地零成本，对演示与测试价值最大。
-- **验收**：`config.json` 切 `provider: ollama` 可正常对话。
-- **预估**：0.5 天
+#### P1-4 模型厂商扩展：ollama / dashscope ✅（2026-10-08 完成）
+- **实现**：`ModelProvider` 增加 `OLLAMA`（默认 `http://localhost:11434/v1`，key 可缺省填占位符）、`DASHSCOPE`（默认 compatible-mode 端点）；两者走 `OpenAIChatModel`，无需新依赖。`ModelProviderTest` 3 例覆盖。
+- **验收**：解析与端点单测通过；真实 ollama/dashscope 服务对话未实测（本机无 ollama 运行时）。
 
-#### P1-5 渲染与中断体验
-- **方案**：`TOOL_CALL_START` 显示工具名与参数摘要（当前只打"调用工具…"）；文件编辑类工具展示 diff 摘要；支持 Ctrl+C/Esc 中断当前轮（取消订阅事件流，保留会话状态）。
-- **预估**：1 天
+#### P1-5 渲染与中断体验 ⚠️ 部分完成（2026-10-08）
+- **已完成**：`TOOL_CALL_START` 显示工具名；`TOOL_RESULT_END` 行附带入参 JSON 摘要（截断 100 字符，缓冲自 `TOOL_CALL_DELTA`）。
+- **未完成**：文件编辑类工具的 diff 摘要；Ctrl+C/Esc 中断当前轮（阻塞式 `BufferedReader` + Windows 控制台信号处理改造量大，且需取消 Reactor 订阅并处理会话半完成状态，建议单独立项）。
 
 ### P2 — 工程质量与可选增强
 
-#### P2-1 测试补齐
-- **现状**：仅 `AgentTest`（调真实模型、无断言，且 `toolkit.registerTool(toolkit)` 属笔误）与 `AppConfigTest`。
-- **方案**：按技术设计 §9 —— AppConfig/McpConfig 校验边界（已有部分）、`SlashCommand` 分发、`PermissionPolicy` 匹配、AgentState 持久化-恢复（同 sessionId 两轮）、Plan Mode 拒绝路径；模型依赖用 mock 或 ollama 本地模型；修正 `AgentTest`。
-- **预估**：1~2 天
+#### P2-1 测试补齐 ✅（2026-10-10 完成，并抓到两个真 bug）
+- **实现**：`mvn test` **全密闭**（无需配置与网络），36 用例全过：新增 `McpConfigTest`（8：结构校验/`${ENV}` 展开/Windows 补 cmd）、`SessionManagerTest`（3）、`WorkspaceInitializerTest`（2）、`AgentStatePersistenceTest`（1：假模型 + 新实例共享 stateStore，验证同会话两轮历史恢复）；重写 `AppConfigTest`（8：校验边界 + 示例文件）；`AgentTest` 修正笔误（原 `toolkit.registerTool(toolkit)`）+ 补断言 + 改为 `DL_LIVE_TEST=true` 才跑的 opt-in live 测试。
+- **抓到的 bug ①**：`SessionManager` 的 DTO 字段 private 无 getter，Jackson 默认不序列化——`sessions.json` 恒写空对象，跨进程会话清单从未持久化。已修（字段改 public）。
+- **抓到的 bug ②**：pom 钉 `jackson-databind:2.17.2` 与 harness 传递的 `jackson-dataformat-yaml:2.21.1` 冲突，子代理 frontmatter 解析直接 `NoSuchMethodError`（此前表现为静默挂死）。已对齐 2.21.1。
+- **未覆盖**：`SlashCommand` 分发（命令是绑定 CoderCli 实例的 lambda，抽接口需重构，违背最小改动原则）；Plan Mode 拒绝路径（需模拟工具调用流，留待 P1-5 中断机制一起做）。
 
-#### P2-2 workspace 首启模板初始化
-- **方案**：首启检测工作区为空时，复制内置模板（AGENTS.md / skills/commit-convention / subagents/reviewer.md，对齐技术设计 §4 的 `workspace/` 包规划）。
-- **预估**：0.5 天
+#### P2-2 workspace 首启模板初始化 ✅（2026-10-10 完成）
+- **实现**：`workspace/WorkspaceInitializer` + classpath 模板（AGENTS.md 工作区规约 / skills/commit-convention / subagents/reviewer），`CoderCli.main` 首启补齐，**已存在的一律不覆盖**。实测：真实工作区首启打印初始化清单，`/skills` 列出技能。
+- **注意**：classpath 资源路径必须带前导 `/`（相对路径会解析到本类包下），测试抓出。
 
-#### P2-3 子代理落地
-- **方案**：验证 Harness 的 `agent_spawn`/`agent_send` 声明式子代理（`workspace/subagents/*.md`）在本项目可用，补 reviewer 模板并演示"委派代码审查"。
-- **预估**：0.5~1 天
+#### P2-3 子代理落地 ⚠️ 机制验证通过，结果回传不稳定（2026-10-10）
+- **已验证**：`subagents/reviewer.md` 模板被框架发现；`agent_spawn`（y 确认后）成功拉起 reviewer 独立 ReAct 循环（真实 read/grep/execute 审查动作）；`agent_send` 双向通信可发起（再次确认）。
+- **已知问题**：① 子代理默认迭代上限偏小，reviewer 深挖框架源码时超迭代提前结束、首轮无最终报告；② `agent_send` 回复为空、`session_history`/`session_list` 查不到子代理会话——产出取不回来（主 agent 最终 fallback 自己审查）。根因疑在 2.0.2 上游（异步任务通道/会话登记），后续可从 `wait_async_results`/`task_list` 异步模式入手排查。
+- **顺手修复**：jackson 版本冲突（见 P2-1 bug ②）——不修则 spawn 在解析 frontmatter 时即崩。
 
-#### P2-4 Docker 沙箱可选切换（可选）
-- **方案**：`DL_SANDBOX=docker` 时 factory 切 `DockerFilesystemSpec`（技术设计 §5.9），镜像按硬约束清单核验。
-- **预估**：1 天（视 Docker 环境）
+#### P2-4 Docker 沙箱可选切换 ⬜ 未做（可选项）
+- 本机无 Docker 环境，按计划标记为可选，未动。
 
-#### P2-5 安全整改：config.json 中的真实 API Key
-- **现状**：项目根 `config.json` 内含真实 API Key（该文件实际不被读取，`AppConfig` 读 `~/.dl-coder/config.json`）。项目**尚未初始化 git**，一旦入库极易泄露。
-- **方案**：作废该 key；项目根示例文件改为占位符（`sk-xxx`）并改名 `config.example.json`；**建议先 `git init` 并提交一版干净基线**，`.gitignore` 排除 `config.json`。
-- **预估**：10 分钟
+#### P2-5 安全整改：config.json 中的真实 API Key ✅（2026-10-10 完成）
+- **现状**：项目根 `config.json`（含真实 key）已删除；git 历史从未包含它（`.gitignore` 第 28 行已排除，仓库只有 `config.example.json` 占位符）。
+- **遗留（用户操作）**：该 key 曾明文出现在仓库目录与 `~/.dl-coder/config.json`，**建议到 bigmodel 控制台作废重建**。
 
-#### P2-6 Windows 兼容标注
-- **现状**：`list_files` 跨盘符报错（`'other' has different root`）。
-- **方案**：排查是上游问题还是用法问题；短期在 README 标注 Windows 已知限制与 Git Bash 建议。
-- **预估**：0.5 天
+#### P2-6 Windows 兼容标注 ✅（2026-10-10 完成）
+- **实现**：README 重写——快速开始、配置表、**Windows 已知限制**（跨盘符 `'other' has different root` 及绕行、GBK 控制台与 `chcp 65001`、MCP stdio 的 `.cmd` 说明）、Git Bash + Windows Terminal 建议。
 
 ---
 
@@ -110,8 +108,8 @@
 | 批次 | 内容 | 预估 | 出口标准 |
 |---|---|---|---|
 | **第一批（安全闭环）** | ✅ P0-3 maxIters → ✅ P0-2 权限规则 → ✅ P0-1 确认流 → ✅ P0-4 web_fetch 核查（2026-09-29，出口标准全过）；⬜ P2-5 安全整改 + git 基线仍待办 | ~2.5 天 | `git push`/`rm -rf` 弹 y/n 且 `a` 可持久放行；读 `.env` 被拒；50 轮迭代不截断 |
-| **第二批（M5 收尾）** | P1-1 命令补全 → P1-2 token 统计 → P1-3 MCP 实测 → P1-4 ollama/dashscope | ~2.5 天 | PRD M5 验收脚本全过：MCP 真实调用成功、`/model` 即时生效、`/stats` 出 token 数 |
-| **第三批（质量与增强）** | P2-1 测试 → P1-5 渲染/中断 → P2-2 模板 → P2-3 子代理 →（可选）P2-4 沙箱 | ~3~4 天 | 关键路径有测试护栏；子代理演示可跑 |
+| **第二批（M5 收尾）** | ✅ P1-1 命令补全 → ✅ P1-2 token 统计（网关不回传 usage 时显示 0）→ ✅ P1-3 MCP 实测（含 Windows npx.cmd 与 /exit 挂住两个修复）→ ✅ P1-4 ollama/dashscope（2026-10-08）；⚠️ P1-5 渲染/中断部分完成（工具名+参数摘要已做，diff 摘要与 Ctrl+C 中断未做，建议单独立项） | ~2.5 天 | MCP 真实调用成功、`/model` 即时生效、`/stats` 出 token 数（依赖网关回传） |
+| **第三批（质量与增强）** | ✅ P2-1 测试（36 例密闭，抓到 SessionManager 序列化与 jackson 冲突两个真 bug）→ ✅ P2-2 模板 → ⚠️ P2-3 子代理（spawn/独立循环/send 验证通过，结果回传不稳定，遗留上游排查）→ ✅ P2-5 安全整改 → ✅ P2-6 Windows 标注（2026-10-10）；⬜ P2-4 沙箱（可选，本机无 Docker）；⬜ P1-5 剩余（diff 摘要与 Ctrl+C 中断，建议单独立项） | ~3~4 天 | 关键路径有测试护栏；子代理演示可跑 |
 
 原则：
 1. 每项独立可验收，做完即跑对应验证命令，不攒批；

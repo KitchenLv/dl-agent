@@ -1,0 +1,18 @@
+{
+  "provider": "anthropic",
+  "model": {
+    "name": "claude-sonnet-5",
+    "apiKey": "sk-xxx",
+    "baseUrl": "https://api.anthropic.com"
+  },
+  "mcp": {
+    "mcpServers": {
+      "filesystem": {
+        "transport": "stdio",
+        "command": "npx",
+        "args": ["-y", "@modelcontextprotocol/server-filesystem", "."],
+        "enableTools": ["read_file", "write_file"]
+      }
+    }
+  }
+}

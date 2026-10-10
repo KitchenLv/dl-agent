@@ -98,14 +98,16 @@ public class SessionManager {
         static final String CONFIG_DIR = ".dl-coder";
     }
 
+    // DTO 字段必须可见：Jackson 默认不序列化 private 字段，曾导致 sessions.json 恒为空对象、
+    // 跨进程会话清单丢失（P2-1 测试发现）
     @JsonIgnoreProperties(ignoreUnknown = true)
     private static final class RegistryDto {
-        List<EntryDto> sessions = new ArrayList<>();
+        public List<EntryDto> sessions = new ArrayList<>();
     }
 
     @JsonIgnoreProperties(ignoreUnknown = true)
     private static final class EntryDto {
-        String name;
-        String createdAt;
+        public String name;
+        public String createdAt;
     }
 }

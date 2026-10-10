@@ -6,7 +6,11 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.agentscope.harness.agent.tools.McpServerConfig;
 import io.agentscope.harness.agent.tools.ToolsConfig;
 import io.dl.coder.exceptions.ConfigException;
+import java.io.File;
 import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.InvalidPathException;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -124,7 +128,7 @@ public class McpConfig {
         }
         try {
             if (server.getCommand() != null) {
-                server.setCommand(expand(server.getCommand()));
+                server.setCommand(windowsCommandFix(expand(server.getCommand())));
             }
             server.setArgs(expandList(server.getArgs()));
             server.setEnv(expandMap(server.getEnv()));
@@ -138,6 +142,48 @@ public class McpConfig {
                     "MCP 服务器 [" + name + "] " + e.getMessage());
         }
         return server;
+    }
+
+    /**
+     * Windows 下 stdio 进程由 ProcessBuilder 直接拉起，不做 PATHEXT 解析—— 写 "npx" 找不到
+     * npx.cmd，server 注册静默失败（框架只打日志不阻断启动）。这里给无扩展名的命令 补 ".cmd"（存在则用，
+     * 否则保持原样）。
+     */
+    private static String windowsCommandFix(String command) {
+        if (!IS_WINDOWS || command == null || command.isBlank()) {
+            return command;
+        }
+        Path path = Path.of(command);
+        if (path.getNameCount() != 1 || command.lastIndexOf('.') >= 0) {
+            // 绝对/相对路径或已带扩展名：不动
+            return command;
+        }
+        String cmd = command + ".cmd";
+        return resolvesOnPath(cmd) ? cmd : command;
+    }
+
+    private static final boolean IS_WINDOWS =
+            System.getProperty("os.name", "").toLowerCase().contains("win");
+
+    /** 在 PATH 上按 PATHEXT 语义找可执行文件（cmd 也覆盖 PATHEXT.COM 的场景）。 */
+    private static boolean resolvesOnPath(String executable) {
+        String pathEnv = System.getenv("PATH");
+        if (pathEnv == null) {
+            return false;
+        }
+        for (String dir : pathEnv.split(File.pathSeparator)) {
+            if (dir.isBlank()) {
+                continue;
+            }
+            try {
+                if (Files.isRegularFile(Path.of(dir, executable))) {
+                    return true;
+                }
+            } catch (InvalidPathException ignored) {
+                // PATH 里的非法条目跳过
+            }
+        }
+        return false;
     }
 
     // -----------------------------------------------------------------
