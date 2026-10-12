@@ -68,6 +68,8 @@ public class ConsoleRenderer {
         turnOutputTokens = 0;
         printedTextThisTurn = false;
         toolCallInputs.clear();
+        // 两个缓存都要清：跨回合残留会无限累积（长会话内存泄漏），陈旧 toolCallId 还可能串台
+        toolResultTexts.clear();
     }
 
     /** 处理单个事件（在流回调中调用）。 */
@@ -183,7 +185,9 @@ public class ConsoleRenderer {
         if (text.isEmpty() || "{}".equals(text)) {
             return "";
         }
-        return text.length() > 100 ? " " + text.substring(0, 100) + "…" : " " + text;
+        // 流式入参可能是带换行的多行 JSON：控制字符压成空格，保证状态仍是暗色单行
+        String oneLine = text.replaceAll("\\p{Cntrl}+", " ").strip();
+        return oneLine.length() > 100 ? " " + oneLine.substring(0, 100) + "…" : " " + oneLine;
     }
 
     private void newlineIfPrinting() {

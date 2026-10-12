@@ -11,7 +11,8 @@
     <properties>
         <maven.compiler.source>26</maven.compiler.source>
         <maven.compiler.target>26</maven.compiler.target>
-        <agentscope.version>2.0.2</agentscope.version>
+        <!-- 本地 D:\KitchenLv\agentscope-java-main 构建的快照：含跨盘 toCwdRelativePath 修复 -->
+        <agentscope.version>2.0.4-SNAPSHOT</agentscope.version>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     </properties>
 

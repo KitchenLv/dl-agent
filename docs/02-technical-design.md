@@ -222,11 +222,12 @@ agent.streamEvents(new UserMessage(input), ctx)
 | 命令 | 实现 |
 |---|---|
 | `/exit` | 退出循环 |
-| `/session new\|list\|switch <id>` | REPL 维护 sessionId |
+| `/session new [id]\|list\|switch <id>` | REPL 维护 sessionId；启动进入空会话（随机名 eager id、不落盘），首条消息物化注册；`new` 无参 = 随机名（形容词-名词-两位数） |
 | `/plan` | `agent.enterPlanMode(ctx)` / `agent.exitPlanMode(ctx)`（程序化入口，不触发 HITL） |
 | `/plan status` | `agent.isPlanModeActive(ctx)` + 读 `plans/PLAN.md` |
 | `/memory` | 打印 `MEMORY.md` 尾部 N 行 |
-| `/skills` | 列出 workspace `skills/` 目录 |
+| `/init` | 固定提示词走 chat 管线，agent 分析项目生成/合并项目根 `AGENTS.md`（写入过 HITL 确认） |
+| `/skills` | 双来源列出技能：workspace 个人 `skills/` + 项目 `.dl-coder/skills/`（标注来源） |
 | `/model <id>` | 改 `AppConfig.modelId` 并重建 agent 实例 |
 | `/cd <path>` | 改 `projectDir` 并重建 agent 实例 |
 | `/perm <mode>` | 切换 `PermissionMode`：`default` / `explore`（只读）/ `accept-edits`（M4，`agent.setPermissionMode(ctx, mode)`） |
@@ -460,7 +461,7 @@ AGENTS.md（人格与规约的唯一载体，节选）：
 | 长期记忆 | `.memory(MemoryConfig)`（默认开） | M1 开，M2 调 throttle |
 | 子代理 | `workspace/subagents/*.md` 或 `.subagent(...)` | M3 开 |
 | Plan Mode | `.enablePlanMode()`（默认关） | M3 开 |
-| 技能 | `workspace/skills/`（免注册） | M3 开 |
+| 技能 | `workspace/skills/`（个人）+ `projectGlobalSkillsDir(<项目根>/.dl-coder/skills)`（项目，禁用 overlay 裸 `skills/` 发现） | M3 开 |
 | 本机文件系统 | `.filesystem(new LocalFilesystemSpec()...)` | M1 开 |
 | Docker 沙箱 | `.filesystem(new DockerFilesystemSpec()...)` | M4 可选切换 |
 | 通道/网关 | `agent.channel(ChatUiChannel.create())` | 不用（纯 CLI 直连 `call`/`streamEvents`） |

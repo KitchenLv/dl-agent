@@ -2,8 +2,10 @@ package io.dl.coder.workspace;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -49,10 +51,30 @@ public final class WorkspaceInitializer {
                     throw new IOException("内置模板缺失: " + CLASSPATH_DIR + relative);
                 }
                 Files.createDirectories(target.getParent());
-                Files.copy(in, target);
+                copyAtomically(in, target);
                 created.add(relative);
             }
         }
         return created;
+    }
+
+    /**
+     * 先写同目录临时文件、再原子移动到目标。直接往目标写的话，进程中途被杀或磁盘写满 会留下截断文件，
+     * 而初始化按 "存在即完整" 跳过，残缺模板永远不会被修复。原子移动不被文件系统 支持时退化为普通移动
+     * （目标尚未存在，失败也只会留下临时文件，不会出现半成品目标）。
+     */
+    private static void copyAtomically(InputStream in, Path target) throws IOException {
+        Path tmp = Files.createTempFile(target.getParent(), target.getFileName().toString(), ".tmp");
+        try {
+            Files.copy(in, tmp, StandardCopyOption.REPLACE_EXISTING);
+            try {
+                Files.move(tmp, target, StandardCopyOption.ATOMIC_MOVE);
+            } catch (AtomicMoveNotSupportedException e) {
+                Files.move(tmp, target);
+            }
+        } finally {
+            // 移动成功后 tmp 已不存在；失败时清掉残片，避免工作区堆积 .tmp
+            Files.deleteIfExists(tmp);
+        }
     }
 }

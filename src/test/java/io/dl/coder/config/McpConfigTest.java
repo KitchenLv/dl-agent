@@ -72,15 +72,15 @@ class McpConfigTest {
     }
 
     @Test
-    void windows下裸命令自动补cmd后缀() throws Exception {
+    void windows下裸命令按PATHEXT补可执行后缀() throws Exception {
         assumeTrue(System.getProperty("os.name", "").toLowerCase().contains("win"),
                 "仅 Windows 平台执行");
         JsonNode node = MAPPER.readTree(
                 "{\"mcpServers\": {\"a\": {\"transport\": \"stdio\", \"command\": \"npx\", \"args\": [\"-y\", \"x\"]}}}");
         McpConfig config = McpConfig.parse(node);
-        // 本机 PATH 上有 npx.cmd 时应补全；否则保持原样（不失败）
+        // 本机 PATH 上能按 PATHEXT 后缀（.cmd/.exe/.bat 等）找到 npx 时应补全；否则保持原样（不失败）
         String command = config.getMcpServers().get("a").getCommand();
-        assertTrue(command.equals("npx") || command.equals("npx.cmd"), command);
+        assertTrue(command.equals("npx") || command.matches("npx\\.[A-Za-z0-9]+"), command);
     }
 
     private void assertParseFails(String json) throws Exception {

@@ -146,8 +146,9 @@ public class McpConfig {
 
     /**
      * Windows 下 stdio 进程由 ProcessBuilder 直接拉起，不做 PATHEXT 解析—— 写 "npx" 找不到
-     * npx.cmd，server 注册静默失败（框架只打日志不阻断启动）。这里给无扩展名的命令 补 ".cmd"（存在则用，
-     * 否则保持原样）。
+     * npx.cmd，server 注册静默失败（框架只打日志不阻断启动）。这里对无扩展名的裸命令按 PATHEXT
+     * 顺序（默认 .COM;.EXE;.BAT;.CMD）在 PATH 上探测，命中则补上后缀（只补 .cmd 会漏掉 以 .exe
+     * / .bat 存在的 python、uvx 等），都不存在则保持原样。
      */
     private static String windowsCommandFix(String command) {
         if (!IS_WINDOWS || command == null || command.isBlank()) {
@@ -158,8 +159,29 @@ public class McpConfig {
             // 绝对/相对路径或已带扩展名：不动
             return command;
         }
-        String cmd = command + ".cmd";
-        return resolvesOnPath(cmd) ? cmd : command;
+        for (String ext : pathExtensions()) {
+            String candidate = command + ext;
+            if (resolvesOnPath(candidate)) {
+                return candidate;
+            }
+        }
+        return command;
+    }
+
+    /** PATHEXT 顺序的后缀表（小写归一、去空去重）；环境变量缺失或全空时用 Windows 默认值。 */
+    private static List<String> pathExtensions() {
+        String pathExt = System.getenv("PATHEXT");
+        if (pathExt == null || pathExt.isBlank()) {
+            return List.of(".com", ".exe", ".bat", ".cmd");
+        }
+        List<String> exts = new ArrayList<>();
+        for (String e : pathExt.split(File.pathSeparator)) {
+            String ext = e.strip().toLowerCase();
+            if (!ext.isEmpty() && !exts.contains(ext)) {
+                exts.add(ext);
+            }
+        }
+        return exts.isEmpty() ? List.of(".com", ".exe", ".bat", ".cmd") : exts;
     }
 
     private static final boolean IS_WINDOWS =

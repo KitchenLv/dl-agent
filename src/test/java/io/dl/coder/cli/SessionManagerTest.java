@@ -47,4 +47,33 @@ class SessionManagerTest {
         manager.register("gamma");
         assertEquals(List.of("gamma"), new SessionManager(file).names());
     }
+
+    @Test
+    void 随机名匹配形容词名词两位数格式() {
+        SessionManager manager = new SessionManager(tempDir.resolve("sessions.json"));
+        for (int i = 0; i < 100; i++) {
+            assertTrue(manager.randomName().matches("^[a-z]+-[a-z]+-\\d{2}$"),
+                    "随机名格式应为 形容词-名词-两位数");
+        }
+    }
+
+    @Test
+    void 随机名不与现有会话重名() {
+        SessionManager manager = new SessionManager(tempDir.resolve("sessions.json"));
+        String name = manager.randomName();
+        manager.register(name);
+        // 大量抽样确认查重生效：已注册名不会再被生成（词表空间 9 万+，撞名概率极低）
+        for (int i = 0; i < 200; i++) {
+            assertTrue(!name.equals(manager.randomName()), "随机名必须避开已注册条目");
+        }
+    }
+
+    @Test
+    void 随机名命中stateStore文件名安全字符集() {
+        SessionManager manager = new SessionManager(tempDir.resolve("sessions.json"));
+        // JsonFileAgentStateStore 的安全模式：不匹配的 sessionId 会被 Base64 编码成不可读目录名
+        for (int i = 0; i < 100; i++) {
+            assertTrue(manager.randomName().matches("^[a-zA-Z0-9_\\-.]+$"));
+        }
+    }
 }

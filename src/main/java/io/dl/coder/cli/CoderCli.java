@@ -72,7 +72,10 @@ public class CoderCli implements AutoCloseable {
     private final Map<String, SlashCommand> commands = new LinkedHashMap<>();
     private final Map<String, String> helps = new LinkedHashMap<>();
 
-    private String currentSession = SessionManager.DEFAULT_SESSION;
+    /** 未物化会话的提示符占位（启动即生成随机 sessionId，首条消息才注册落盘）。 */
+    private static final String FRESH_SESSION_LABEL = "新会话";
+
+    private String currentSession;
     /** 项目根：execute 的 cwd、代码落点；/cd 可变，变更后重建 agent。 */
     private Path projectDir;
     /** 可变：/model、/cd 重建。会话状态在 stateStore，不随实例销毁。 */
@@ -93,7 +96,10 @@ public class CoderCli implements AutoCloseable {
                 new InputStreamReader(System.in, System.out.charset()));
         this.renderer = new ConsoleRenderer(this.out);
         this.sessions = SessionManager.createDefault();
-        this.sessions.register(currentSession);
+        // eager id + lazy 注册：启动即生成随机 sessionId 供 RuntimeContext（/plan、/perm 等
+        // 会话级命令在未物化时也能正常作用），但不写注册表——首条用户消息才物化，未聊天
+        // 退出零残留
+        this.currentSession = sessions.randomName();
         registerCommands();
     }
 
@@ -108,7 +114,9 @@ public class CoderCli implements AutoCloseable {
         }
         AppConfig config = AppConfig.load();
         Path projectDir = Path.of(System.getProperty("user.dir")).toAbsolutePath().normalize();
-        HarnessAgent agent = CoderAgentFactory.createAgent(workspace, new Toolkit());
+        // 传入已加载的 config 与 projectDir：两参重载内部会再 load 一次，那份实例与
+        // CLI 持有的 config 不是同一对象，两者会静默失同步
+        HarnessAgent agent = CoderAgentFactory.createAgent(workspace, new Toolkit(), config, projectDir);
         try (CoderCli cli = new CoderCli(agent, config.getMcp(), config, workspace, projectDir)) {
             cli.run();
         }
@@ -125,10 +133,15 @@ public class CoderCli implements AutoCloseable {
         }
     }
 
+    /** 当前提示符显示名：未物化显示占位，物化后为会话名。 */
+    private String sessionLabel() {
+        return sessions.exists(currentSession) ? currentSession : FRESH_SESSION_LABEL;
+    }
+
     public void run() {
         printBanner();
         while (true) {
-            out.print("[" + currentSession + "] you> ");
+            out.print("[" + sessionLabel() + "] you> ");
             out.flush();
             String line;
             try {
@@ -175,7 +188,10 @@ public class CoderCli implements AutoCloseable {
             printHelp();
             return true;
         });
-        register("/session", "/session [list|new|switch] 会话管理", this::session);
+        register("/session", "/session [list|new|switch] 会话管理（new 可不带名字=随机名）",
+                this::session);
+        register("/init", "/init                        初始化项目 AGENTS.md（agent 分析项目生成）",
+                this::init);
         register("/plan", "/plan on|off|status         计划模式（只读调研 → 人确认 → 执行）", this::plan);
         register("/perm", "/perm [mode]                权限模式（default|explore|accept-edits|dont-ask）",
                 this::perm);
@@ -183,7 +199,8 @@ public class CoderCli implements AutoCloseable {
         register("/cd", "/cd [path]                  查看/切换项目根（重建 agent，execute 的 cwd 跟随）",
                 this::cd);
         register("/memory", "/memory                      查看 MEMORY.md 尾部", this::memory);
-        register("/skills", "/skills                      列出工作区技能", this::skills);
+        register("/skills", "/skills                      列出技能（个人 workspace + 项目 .dl-coder/skills）",
+                this::skills);
         register("/mcp", "/mcp                        查看 MCP 服务器", args -> {
             out.println(mcp == null || mcp.isEmpty() ? "未配置 MCP 服务器（config.json 的 mcp 段）"
                     : "MCP 服务器:\n" + mcp.summary());
@@ -217,6 +234,16 @@ public class CoderCli implements AutoCloseable {
     // -----------------------------------------------------------------
 
     private void chat(String input) {
+        // 首条用户消息物化会话：此前 sessionId 已存在但未注册（eager id + lazy 注册）
+        if (!sessions.exists(currentSession)) {
+            sessions.register(currentSession);
+            out.println("已创建会话: " + currentSession);
+        }
+        if (agent == null) {
+            // rebuildAgent() 先关旧再建新，重建失败时 agent 为 null（失败原因已由 run() 打印）
+            out.println("agent 当前不可用（上次重建失败），请用 /model <模型名> 或 /cd <路径> 重试");
+            return;
+        }
         RuntimeContext ctx = currentContext();
         renderer.beginTurn();
         try {
@@ -363,7 +390,9 @@ public class CoderCli implements AutoCloseable {
     private boolean session(String[] parts) {
         RuntimeContext ctx = currentContext();
         if (parts.length == 1) {
-            out.println("当前会话: " + currentSession + "（plan mode: "
+            boolean started = sessions.exists(currentSession);
+            out.println("当前会话: " + (started ? currentSession : "（未开始，首条消息后将创建 "
+                    + currentSession + "）") + "（plan mode: "
                     + (agent.isPlanModeActive(ctx) ? "开" : "关") + "）");
             return true;
         }
@@ -375,9 +404,11 @@ public class CoderCli implements AutoCloseable {
                                 + name + "  (" + sessions.createdAt(name) + ")"));
             }
             case "new" -> {
-                requireName(parts, "/session new <名字>");
-                sessions.register(parts[2]);
-                currentSession = parts[2];
+                // 无参 = 随机名；带参 = 指定名。均为显式创建，立即注册
+                String name = parts.length >= 3 && !parts[2].isBlank() ? parts[2]
+                        : sessions.randomName();
+                sessions.register(name);
+                currentSession = name;
                 out.println("已新建并切换到会话: " + currentSession);
             }
             case "switch" -> {
@@ -386,7 +417,7 @@ public class CoderCli implements AutoCloseable {
                 currentSession = parts[2];
                 out.println("已切换到会话: " + currentSession);
             }
-            default -> out.println("用法: /session [list|new <名字>|switch <名字>]");
+            default -> out.println("用法: /session [list|new [名字]|switch <名字>]");
         }
         return true;
     }
@@ -433,6 +464,28 @@ public class CoderCli implements AutoCloseable {
         return true;
     }
 
+    /** /init 的罐头提示词：走 chat 管线由 agent 分析项目并生成/合并 AGENTS.md。 */
+    private static final String INIT_PROMPT = """
+            请分析当前项目并生成项目根目录的 AGENTS.md（若已存在，先读旧内容，在其基础上
+            合并更新，不要推倒重写、不要丢失既有内容）。要求：
+
+            1. 先调研：读构建文件（pom.xml/package.json 等）、目录结构、入口类，必要时检索代码
+            2. 产出中文的 AGENTS.md，包含：
+               - 构建与测试命令（常用目标、单测运行方式）
+               - 架构概览（模块划分、关键入口、核心数据流）
+               - 代码约定（语言/风格/注释/提交规范等项目中实际在用的）
+            3. 只写事实：命令必须真实可跑、结构必须与代码一致，不确定的宁可不写
+            4. 写入项目根的 AGENTS.md（相对路径 AGENTS.md）
+
+            完成后简要汇报生成了哪些内容。""";
+
+    /** /init：初始化项目规约（AGENTS.md），参考 Claude Code 的 /init。 */
+    private boolean init(String[] parts) {
+        out.println("正在初始化项目规约（AGENTS.md）…");
+        chat(INIT_PROMPT);
+        return true;
+    }
+
     /** /model：无参显示当前模型；带参热切换（改内存配置 + 重建 agent，不落盘）。 */
     private boolean model(String[] parts) {
         if (parts.length < 2) {
@@ -442,8 +495,15 @@ public class CoderCli implements AutoCloseable {
             return true;
         }
         String name = parts[1];
+        String previous = config.getModel().getName();
         config.getModel().setName(name);
-        rebuildAgent();
+        try {
+            rebuildAgent();
+        } catch (Exception e) {
+            // 重建失败回滚显示名，避免 /model 显示一个从未生效的模型
+            config.getModel().setName(previous);
+            throw e;
+        }
         out.println("已切换模型 → " + config.getProviderEnum().toString().toLowerCase() + "/" + name
                 + "（下一轮生效，会话上下文保留）");
         return true;
@@ -455,13 +515,22 @@ public class CoderCli implements AutoCloseable {
             out.println("当前项目根: " + projectDir);
             return true;
         }
-        Path target = Path.of(parts[1]).toAbsolutePath().normalize();
+        // 相对路径相对当前项目根解析（resolve 遇绝对参数会直接返回该参数）；
+        // 不能 toAbsolutePath() 裸转——它锚定 JVM 进程 CWD（从不变化），连续 /cd 会锚错基准
+        Path target = projectDir.resolve(parts[1]).toAbsolutePath().normalize();
         if (!Files.isDirectory(target)) {
             out.println("目录不存在: " + target);
             return true;
         }
+        Path previous = projectDir;
         projectDir = target;
-        rebuildAgent();
+        try {
+            rebuildAgent();
+        } catch (Exception e) {
+            // 重建失败回滚项目根，与 /model 的回滚保持一致
+            projectDir = previous;
+            throw e;
+        }
         out.println("项目根已切换 → " + projectDir + "（execute 的 cwd 与文件边界跟随，会话上下文保留）");
         return true;
     }
@@ -486,40 +555,50 @@ public class CoderCli implements AutoCloseable {
         return true;
     }
 
-    /** /skills：列出工作区 skills/ 下的技能目录。 */
+    /** /skills：双来源列出技能——workspace 个人技能 + 项目 .dl-coder/skills 项目技能。 */
     private boolean skills(String[] parts) {
-        Path dir = workspace.resolve("skills");
-        if (!Files.isDirectory(dir)) {
-            out.println("尚无技能目录（" + dir + "）。放入 skills/<名字>/SKILL.md 即可被 agent 发现。");
+        List<String> personal = skillNames(workspace.resolve("skills"));
+        List<String> project = skillNames(projectDir.resolve(".dl-coder").resolve("skills"));
+        if (personal.isEmpty() && project.isEmpty()) {
+            out.println("暂无技能。个人技能放 ~/.dl-coder/workspace/skills/<名字>/SKILL.md，"
+                    + "项目技能放 <项目根>/.dl-coder/skills/<名字>/SKILL.md。");
             return true;
         }
+        personal.forEach(name -> out.println("  (个人) " + name));
+        project.forEach(name -> out.println("  (项目) " + name));
+        return true;
+    }
+
+    /** 列出一个技能根目录下的技能子目录名（目录不存在/读取失败返回空列表）。 */
+    private static List<String> skillNames(Path dir) {
+        if (!Files.isDirectory(dir)) {
+            return List.of();
+        }
         try (Stream<Path> entries = Files.list(dir)) {
-            List<String> names = entries.filter(Files::isDirectory)
+            return entries.filter(Files::isDirectory)
                     .map(p -> p.getFileName().toString())
                     .sorted()
                     .collect(Collectors.toList());
-            if (names.isEmpty()) {
-                out.println("skills/ 为空。放入 skills/<名字>/SKILL.md 即可被 agent 发现。");
-            } else {
-                out.println("技能: " + String.join(", ", names));
-            }
         } catch (IOException e) {
-            out.println("读取失败: " + e.getMessage());
+            return List.of();
         }
-        return true;
     }
 
     // -----------------------------------------------------------------
     // 辅助
     // -----------------------------------------------------------------
 
-    /** 按当前配置与项目根重建 agent（/model、/cd 用）。旧实例关闭，会话状态在 stateStore 不受影响。 */
+    /**
+     * 按当前配置与项目根重建 agent（/model、/cd 用）。 先关旧再建新——先建后关会让两个 agent 短暂同时
+     * 持有同一 (userId, sessionId) 的状态文件锁、并重复拉起 MCP stdio 进程（锁被占用会让新回合挂起）。
+     * 会话状态在 stateStore，不受实例销毁影响；重建失败时 agent 为 null，调用方负责回滚自己的状态。
+     */
     private void rebuildAgent() {
-        HarnessAgent old = this.agent;
-        this.agent = CoderAgentFactory.createAgent(workspace, new Toolkit(), config, projectDir);
-        if (old != null) {
-            old.close();
+        if (agent != null) {
+            agent.close();
+            agent = null;
         }
+        agent = CoderAgentFactory.createAgent(workspace, new Toolkit(), config, projectDir);
     }
 
     private RuntimeContext currentContext() {
