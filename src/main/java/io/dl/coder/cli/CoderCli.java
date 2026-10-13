@@ -11,6 +11,7 @@ import io.agentscope.core.permission.PermissionBehavior;
 import io.agentscope.core.permission.PermissionContextState;
 import io.agentscope.core.permission.PermissionMode;
 import io.agentscope.core.permission.PermissionRule;
+import io.agentscope.core.state.AgentState;
 import io.agentscope.core.tool.AgentTool;
 import io.agentscope.core.tool.ToolBase;
 import io.agentscope.core.tool.Toolkit;
@@ -18,6 +19,9 @@ import io.agentscope.harness.agent.HarnessAgent;
 import io.dl.coder.agent.CoderAgentFactory;
 import io.dl.coder.config.AppConfig;
 import io.dl.coder.config.McpConfig;
+import io.dl.coder.config.ModelProvider;
+import io.dl.coder.config.ThinkingLevel;
+import io.dl.coder.exceptions.ConfigException;
 import io.dl.coder.workspace.WorkspaceInitializer;
 import java.io.BufferedReader;
 import java.io.IOException;
@@ -68,6 +72,10 @@ public class CoderCli implements AutoCloseable {
     private final McpConfig mcp;
     private final AppConfig config;
     private final Path workspace;
+    /** 会话 checkpoint 存储（/rewind 用），每轮对话结束后自动打点 */
+    private final CheckpointManager checkpoints = new CheckpointManager();
+    /** thinking 级别共享引用：与 agent 内的 ThinkingMiddleware 同一实例，/thinking 切换即时生效 */
+    private final AtomicReference<ThinkingLevel> thinkingLevel;
     /** 命令注册表（保持注册顺序，/help 按此生成） */
     private final Map<String, SlashCommand> commands = new LinkedHashMap<>();
     private final Map<String, String> helps = new LinkedHashMap<>();
@@ -82,12 +90,13 @@ public class CoderCli implements AutoCloseable {
     private HarnessAgent agent;
 
     public CoderCli(HarnessAgent agent, McpConfig mcp, AppConfig config, Path workspace,
-            Path projectDir) {
+            Path projectDir, AtomicReference<ThinkingLevel> thinkingLevel) {
         this.agent = agent;
         this.mcp = mcp;
         this.config = config;
         this.workspace = workspace;
         this.projectDir = projectDir;
+        this.thinkingLevel = thinkingLevel;
         // 编码跟随控制台（JDK 18+ 的 System.out.charset() 在控制台上返回其代码页，
         // 如 Windows GBK 936）。不要强制 UTF-8：控制台仍是 GBK 时中文会乱码。
         // 想要完整 UTF-8 体验，可先执行 chcp 65001 再启动。
@@ -115,9 +124,13 @@ public class CoderCli implements AutoCloseable {
         Path projectDir = Path.of(System.getProperty("user.dir")).toAbsolutePath().normalize();
         // 传入已加载的 config 与 projectDir：两参重载内部会再 load 一次，那份实例与
         // CLI 持有的 config 不是同一对象，两者会静默失同步
-        HarnessAgent agent =
-                CoderAgentFactory.createAgent(workspace, new Toolkit(), config, projectDir);
-        try (CoderCli cli = new CoderCli(agent, config.getMcp(), config, workspace, projectDir)) {
+        // thinking 级别共享引用：CLI（/thinking）与 agent（ThinkingMiddleware）经它同步
+        AtomicReference<ThinkingLevel> thinkingLevel =
+                new AtomicReference<>(config.getModel().getThinkingLevelOrOff());
+        HarnessAgent agent = CoderAgentFactory.createAgent(workspace, new Toolkit(), config,
+                projectDir, thinkingLevel);
+        try (CoderCli cli = new CoderCli(agent, config.getMcp(), config, workspace, projectDir,
+                thinkingLevel)) {
             cli.run();
         }
         // MCP stdio 子进程的读线程与 Reactor 调度器是非守护线程，2.0.2 的 close() 不终止它们，
@@ -208,6 +221,13 @@ public class CoderCli implements AutoCloseable {
             out.println(renderer.stats());
             return true;
         });
+        register("/clear", "/clear                      清空当前会话对话上下文（需确认，/rewind 可回退）",
+                this::clear);
+        register("/rewind", "/rewind [n]                回退 n 轮对话（无参列出 checkpoint 交互选择）",
+                this::rewind);
+        register("/thinking",
+                "/thinking [off|low|medium|high] 查看/切换 thinking 深度（写入 config.json）",
+                this::thinking);
     }
 
     /** @return false 表示退出 REPL */
@@ -250,6 +270,14 @@ public class CoderCli implements AutoCloseable {
             return;
         }
         RuntimeContext ctx = currentContext();
+        // 轮次开始前快照 agent 状态：本轮结束后落盘，/rewind 即可回退到本轮之前的状态。
+        // 快照失败只警告不阻断对话（spec：打点失败仅提示）
+        String snapshotJson = null;
+        try {
+            snapshotJson = agent.getDelegate().getAgentState(USER_ID, currentSession).toJson();
+        } catch (RuntimeException e) {
+            out.println("（checkpoint 打点失败，本轮结束后无法 /rewind: " + e.getMessage() + "）");
+        }
         renderer.beginTurn();
         try {
             Msg msg = new UserMessage(input);
@@ -275,6 +303,14 @@ public class CoderCli implements AutoCloseable {
             }
         } finally {
             renderer.endTurn();
+            // 控制权回到 REPL 即视为本轮完成（含确认中断与异常路径）：落盘轮前快照
+            if (snapshotJson != null) {
+                try {
+                    checkpoints.save(currentSession, snapshotJson, input);
+                } catch (IOException e) {
+                    out.println("（checkpoint 落盘失败: " + e.getMessage() + "）");
+                }
+            }
         }
     }
 
@@ -655,6 +691,173 @@ public class CoderCli implements AutoCloseable {
     }
 
     // -----------------------------------------------------------------
+    // 会话管理指令（P1-3 /clear、/rewind、/thinking）
+    // -----------------------------------------------------------------
+
+    /** /clear：确认后清空当前会话对话上下文（框架内部完成持久化）。 */
+    private boolean clear(String[] args) {
+        if (args.length > 1) {
+            out.println("/clear 不接受参数（需要回退请用 /rewind）");
+            return true;
+        }
+        if (agent == null || !sessions.exists(currentSession)) {
+            out.println("当前会话还没有对话内容，无需清除。");
+            return true;
+        }
+        AgentState state = agent.getDelegate().getAgentState(USER_ID, currentSession);
+        String summary = state.getSummary();
+        boolean empty = state.getContext().isEmpty()
+                && (summary == null || summary.isBlank());
+        if (empty) {
+            out.println("当前会话还没有对话内容，无需清除。");
+            return true;
+        }
+        out.println("将清空会话 " + currentSession + " 的对话上下文：");
+        out.println("  - 清除: " + state.getContext().size() + " 条消息"
+                + ((summary == null || summary.isBlank()) ? "" : " 与压缩摘要"));
+        out.println("  - 保留: checkpoint 历史（/rewind 可找回）与文件改动、任务/计划状态");
+        if (!confirm("确认清空? (y/N): ")) {
+            out.println("已取消，未做任何改动。");
+            return true;
+        }
+        agent.clearContext(currentContext());
+        out.println("已清空当前会话上下文。");
+        return true;
+    }
+
+    /** /rewind [n]：对话回退 n 轮（无参交互选择 checkpoint）；只动对话消息，不回退文件改动。 */
+    private boolean rewind(String[] args) {
+        if (agent == null || !sessions.exists(currentSession)) {
+            out.println("当前会话还没有对话历史，无法回退。");
+            return true;
+        }
+        List<CheckpointManager.CheckpointInfo> all = checkpoints.list(currentSession);
+        if (all.isEmpty()) {
+            out.println("该会话还没有 checkpoint（每轮对话结束后自动打点），无法回退。");
+            return true;
+        }
+        int seq;
+        if (args.length > 1) {
+            int rounds;
+            try {
+                rounds = Integer.parseInt(args[1]);
+            } catch (NumberFormatException e) {
+                out.println("回退轮数必须是整数，收到: " + args[1]);
+                return true;
+            }
+            try {
+                seq = CheckpointManager.resolveRewindTarget(all, rounds);
+            } catch (IllegalArgumentException e) {
+                out.println(e.getMessage());
+                return true;
+            }
+        } else {
+            seq = pickCheckpoint(all);
+            if (seq < 0) {
+                out.println("已取消。");
+                return true;
+            }
+        }
+        CheckpointManager.CheckpointInfo target = all.stream()
+                .filter(c -> c.seq() == seq).findFirst().orElseThrow();
+        AgentState snapshot;
+        try {
+            snapshot = checkpoints.load(currentSession, seq);
+        } catch (IOException e) {
+            out.println("读取 checkpoint #" + seq + " 失败: " + e.getMessage());
+            return true;
+        }
+        AgentState live = agent.getDelegate().getAgentState(USER_ID, currentSession);
+        out.println("将回退到 checkpoint #" + seq + "（" + target.time() + " 之前，该轮输入: "
+                + target.messagePrefix() + "）");
+        out.println("  - 上下文消息: " + live.getContext().size() + " 条 → "
+                + snapshot.getContext().size() + " 条（文件改动不回退）");
+        if (!confirm("确认回退? (y/N): ")) {
+            out.println("已取消，未做任何改动。");
+            return true;
+        }
+        int kept = CheckpointManager.applyRewindTruncation(live, snapshot);
+        agent.getDelegate().saveAgentState(USER_ID, currentSession);
+        out.println("已回退，保留 " + kept + " 条消息。");
+        return true;
+    }
+
+    /** /thinking [off|low|medium|high]：查看或切换 thinking 深度，立即生效并写入 config.json。 */
+    private boolean thinking(String[] args) {
+        ThinkingLevel current = thinkingLevel.get();
+        if (args.length <= 1) {
+            out.println("当前 thinking 级别: " + current.lowerName());
+            if (config.getProviderEnum() == ModelProvider.OLLAMA) {
+                out.println("（ollama 本地模型不消费 thinking 参数，级别仅保存不生效）");
+            }
+            out.println("用法: /thinking <off|low|medium|high>");
+            return true;
+        }
+        ThinkingLevel target;
+        try {
+            target = ThinkingLevel.parse(args[1]);
+        } catch (IllegalArgumentException e) {
+            out.println(e.getMessage());
+            return true;
+        }
+        thinkingLevel.set(target);
+        config.getModel().setThinkingLevel(target.lowerName());
+        try {
+            config.save();
+            out.println("thinking 级别已切换为 " + target.lowerName() + "，已写入 config.json。");
+        } catch (ConfigException e) {
+            out.println("thinking 级别已切换为 " + target.lowerName()
+                    + "，但写入 config.json 失败: " + e.getMessage());
+        }
+        return true;
+    }
+
+    /** 交互式列出 checkpoint 供选择（最新在前），返回所选序号；取消返回 -1。 */
+    private int pickCheckpoint(List<CheckpointManager.CheckpointInfo> all) {
+        out.println("可回退到的状态（1 = 最近一轮之前）：");
+        for (int i = 0; i < all.size(); i++) {
+            CheckpointManager.CheckpointInfo c = all.get(all.size() - 1 - i);
+            out.println("  " + (i + 1) + ". 回退 " + (i + 1) + " 轮 → " + c.time()
+                    + "「" + c.messagePrefix() + "」");
+        }
+        out.print("选择（1-" + all.size() + "，回车取消）: ");
+        out.flush();
+        String line = readLineOrNull();
+        if (line == null || line.isBlank()) {
+            return -1;
+        }
+        try {
+            int idx = Integer.parseInt(line.strip());
+            if (idx < 1 || idx > all.size()) {
+                out.println("超出范围: " + idx);
+                return -1;
+            }
+            return all.get(all.size() - idx).seq();
+        } catch (NumberFormatException e) {
+            out.println("不是有效数字: " + line.strip());
+            return -1;
+        }
+    }
+
+    /** y/n 确认：y/yes 执行；回车、Ctrl+D 或其他输入一律取消。 */
+    private boolean confirm(String prompt) {
+        out.print(prompt);
+        out.flush();
+        String line = readLineOrNull();
+        return line != null
+                && (line.strip().equalsIgnoreCase("y") || line.strip().equalsIgnoreCase("yes"));
+    }
+
+    /** 读一行输入，Ctrl+D / IO 错误返回 null（视作取消）。 */
+    private String readLineOrNull() {
+        try {
+            return in.readLine();
+        } catch (IOException e) {
+            return null;
+        }
+    }
+
+    // -----------------------------------------------------------------
     // 辅助
     // -----------------------------------------------------------------
 
@@ -668,7 +871,8 @@ public class CoderCli implements AutoCloseable {
             agent.close();
             agent = null;
         }
-        agent = CoderAgentFactory.createAgent(workspace, new Toolkit(), config, projectDir);
+        agent = CoderAgentFactory.createAgent(workspace, new Toolkit(), config, projectDir,
+                thinkingLevel);
     }
 
     private RuntimeContext currentContext() {

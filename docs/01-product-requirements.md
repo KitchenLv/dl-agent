@@ -81,7 +81,7 @@ Coding Agent 已从"个人提效工具"（Claude Code、Cursor）演进到"组�
 |---|---|---|---|
 | I-1 | 交互式 REPL | P0 | `You>` 提示符、多行输入、退出命令 |
 | I-2 | 流式渲染 | P0 | 文本增量输出 + 工具调用实时展示（调用名、参数摘要、结果状态） |
-| I-3 | 斜杠命令 | P1 | `/exit` `/plan` `/memory` `/skills` `/subagents` `/session` `/clear` `/model` |
+| I-3 | 斜杠命令 | P1 | `/exit` `/plan` `/memory` `/skills` `/subagents` `/session` `/init` `/perm` `/model` `/cd` `/mcp` `/stats` `/clear` `/rewind` `/thinking` |
 | I-4 | 会话管理 | P1 | 新建/切换/列出会话；`sessionId` 显式传入 |
 | I-5 | 工具执行确认 | P1 | 高危操作（如删除、`git push`）执行前请求人工确认 |
 

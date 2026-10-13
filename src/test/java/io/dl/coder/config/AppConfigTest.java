@@ -2,6 +2,7 @@ package io.dl.coder.config;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -81,6 +82,22 @@ class AppConfigTest {
         Path file = write("{\"provider\": \"anthropic\", \"model\": {\"name\": \"m\", \"apiKey\": \"sk-x\"}}");
         AppConfig config = AppConfig.load(file);
         assertEquals(null, config.getMcp());
+    }
+
+    @Test
+    void thinkingLevel读写往返() throws Exception {
+        Path file = write("{\"provider\": \"anthropic\", \"model\": {\"name\": \"m\", \"apiKey\": \"sk-x\","
+                + " \"thinkingLevel\": \"high\"}}");
+        AppConfig config = AppConfig.load(file);
+        assertEquals(ThinkingLevel.HIGH, config.getModel().getThinkingLevelOrOff());
+
+        // /thinking 切换的写回路径：setThinkingLevel + save，重新加载后生效
+        config.getModel().setThinkingLevel(ThinkingLevel.LOW.lowerName());
+        config.save();
+
+        AppConfig reloaded = AppConfig.load(file);
+        assertEquals(ThinkingLevel.LOW, reloaded.getModel().getThinkingLevelOrOff());
+        assertNull(reloaded.getMcp(), "save 写回不应引入多余的 mcp 段");
     }
 
     private Path write(String json) throws Exception {

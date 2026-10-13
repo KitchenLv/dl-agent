@@ -115,7 +115,7 @@ dl-coder/
     │   └── CoderAgentFactory.java # 唯一的 HarnessAgent 装配点（§6.1）
     ├── cli/
     │   ├── CodingChatCli.java     # REPL 主循环、流式渲染
-    │   ├── SlashCommand.java      # /exit /plan /memory /skills /session …
+    │   ├── SlashCommand.java      # /exit /plan /memory /skills /session /clear /rewind /thinking …
     │   └── ConsoleRenderer.java   # TextBlockDelta / ToolCall 事件 → 终端 UI
     ├── config/
     │   └── AppConfig.java         # 环境变量 → 配置对象（API key、沙箱开关…）

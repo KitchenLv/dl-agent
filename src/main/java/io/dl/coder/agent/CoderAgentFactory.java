@@ -16,9 +16,12 @@ import io.agentscope.harness.agent.transcript.FilesystemTranscriptStore;
 import io.dl.coder.config.AppConfig;
 import io.dl.coder.config.McpConfig;
 import io.dl.coder.config.ModelProvider;
+import io.dl.coder.config.ThinkingLevel;
 import io.dl.coder.middleware.ProjectContextMiddleware;
+import io.dl.coder.middleware.ThinkingMiddleware;
 import io.dl.coder.permission.PermissionPolicy;
 import io.dl.coder.prompt.SystemPrompt;
+import java.util.concurrent.atomic.AtomicReference;
 
 public class CoderAgentFactory {
 
@@ -33,12 +36,23 @@ public class CoderAgentFactory {
      */
     public static HarnessAgent createAgent(Path workspace, Toolkit toolkit, AppConfig config,
             Path projectDir) {
+        return createAgent(workspace, toolkit, config, projectDir,
+                new AtomicReference<>(config.getModel().getThinkingLevelOrOff()));
+    }
+
+    /**
+     * thinking 级别共享引用版：/thinking 运行时切换即时生效， /model、/cd 重建 agent 时传入同一引用，级别不丢。
+     */
+    public static HarnessAgent createAgent(Path workspace, Toolkit toolkit, AppConfig config,
+            Path projectDir, AtomicReference<ThinkingLevel> thinkingLevel) {
         McpConfig mcp = config.getMcp();
         var builder = HarnessAgent.builder().model(buildModel(config)).name("dl-coder")
                 .sysPrompt(SystemPrompt.build(projectDir))
                 // 项目 AGENTS.md 每轮注入：绕开框架 readAgentsMd 走 overlay（workspace 上层
                 // 遮蔽项目文件）的限制；/cd 重建 agent 时自动跟随新项目根
                 .middleware(new ProjectContextMiddleware(projectDir))
+                // thinking 级别注入：级别在共享 AtomicReference 上，/thinking 切换下一轮即生效
+                .middleware(new ThinkingMiddleware(config.getProviderEnum(), thinkingLevel))
                 .filesystem(new LocalFilesystemSpec()
                         // project = 目标项目根：作为 overlay 只读下层（读 src 等）+ execute 的 cwd；
                         // projectWritable 让代码文件直接写进项目目录（工作区元数据仍写 workspace）。

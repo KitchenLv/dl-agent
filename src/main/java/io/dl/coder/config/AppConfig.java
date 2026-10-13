@@ -1,6 +1,8 @@
 package io.dl.coder.config;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.dl.coder.exceptions.ConfigException;
@@ -47,10 +49,13 @@ public class AppConfig {
 
     private ModelProvider provider;
     private ModelConfig model;
-    /** mcp 段以原始 JSON 保存，按需解析为 McpConfig（见 {@link #getMcp()}） */
+    /** mcp 段以原始 JSON 保存，按需解析为 McpConfig（见 {@link #getMcp()}）；显式绑定保证双向读写都走本字段 */
+    @JsonProperty("mcp")
     private JsonNode mcp;
 
     private transient McpConfig parsedMcp;
+    /** 配置来源路径（load 时记录），/thinking 等需要写回 config.json 时使用 */
+    private transient Path sourcePath;
 
     /**
      * 从用户目录加载配置；文件不存在时抛出 ConfigException 并提示创建。
@@ -74,6 +79,7 @@ public class AppConfig {
             throw new ConfigException("解析配置文件失败: " + path, e);
         }
         config.validateAndFill(path);
+        config.sourcePath = path.toAbsolutePath().normalize();
         return config;
     }
 
@@ -84,6 +90,24 @@ public class AppConfig {
             return Path.of(override);
         }
         return Path.of(System.getProperty("user.home"), CONFIG_DIR, CONFIG_FILE);
+    }
+
+    /** 配置来源路径（load 时记录）；未经 load() 构造时为 null。 */
+    public Path sourcePath() {
+        return sourcePath;
+    }
+
+    /** 把当前配置写回来源路径（缩进输出）。未经理 load() 加载时抛 ConfigException。 */
+    public void save() {
+        if (sourcePath == null) {
+            throw new ConfigException("配置无来源路径（非经 load() 加载），无法写回");
+        }
+        try {
+            Files.createDirectories(sourcePath.getParent());
+            MAPPER.writerWithDefaultPrettyPrinter().writeValue(sourcePath.toFile(), this);
+        } catch (IOException e) {
+            throw new ConfigException("写回配置文件失败: " + sourcePath, e);
+        }
     }
 
     private void validateAndFill(Path path) {
@@ -108,6 +132,7 @@ public class AppConfig {
         }
     }
 
+    @JsonIgnore
     public ModelProvider getProviderEnum() {
         return provider;
     }
@@ -116,7 +141,8 @@ public class AppConfig {
         return model;
     }
 
-    /** 解析后的 MCP 配置；未配置 mcp 段时返回 null（可选项）。 */
+    /** 解析后的 MCP 配置（派生值，不参与序列化）；未配置 mcp 段时返回 null（可选项）。 */
+    @JsonIgnore
     public McpConfig getMcp() {
         if (parsedMcp == null) {
             parsedMcp = McpConfig.parse(mcp);
