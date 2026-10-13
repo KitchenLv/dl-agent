@@ -84,17 +84,17 @@ public final class PermissionPolicy {
      * （内建工具在 build 时才注册进 agent 自己的 toolkit 副本）。
      */
     public static void harden(Toolkit toolkit) {
-        wrap(toolkit, "execute", in -> str(in.get("command")));
+        wrap(toolkit, "execute", in -> str(in.get("command")), true);
         for (String tool : FILE_TOOLS) {
-            wrap(toolkit, tool, in -> str(in.get("path")));
+            wrap(toolkit, tool, in -> str(in.get("path")), false);
         }
     }
 
     private static void wrap(Toolkit toolkit, String name,
-            Function<Map<String, Object>, String> extractor) {
+            Function<Map<String, Object>, String> extractor, boolean commandStyle) {
         AgentTool existing = toolkit.getTool(name);
         if (existing instanceof ToolBase tb && !(existing instanceof GuardedTool)) {
-            toolkit.registerAgentTool(new GuardedTool(tb, extractor));
+            toolkit.registerAgentTool(new GuardedTool(tb, extractor, commandStyle));
         }
     }
 

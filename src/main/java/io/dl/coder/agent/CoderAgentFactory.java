@@ -34,7 +34,7 @@ public class CoderAgentFactory {
     public static HarnessAgent createAgent(Path workspace, Toolkit toolkit, AppConfig config,
             Path projectDir) {
         McpConfig mcp = config.getMcp();
-        var builder = HarnessAgent.builder().model(buildModel(config)).name("coder-agent")
+        var builder = HarnessAgent.builder().model(buildModel(config)).name("dl-coder")
                 .sysPrompt(SystemPrompt.build(projectDir))
                 // 项目 AGENTS.md 每轮注入：绕开框架 readAgentsMd 走 overlay（workspace 上层
                 // 遮蔽项目文件）的限制；/cd 重建 agent 时自动跟随新项目根
@@ -45,12 +45,12 @@ public class CoderAgentFactory {
                         // 不配的话 ROOTED 策略会把项目绝对路径判为越界 → list_files 等报 ERROR。
                         .project(projectDir).projectWritable(true)
                         .isolationScope(IsolationScope.SESSION))
-                .agentId("coder-agent")
+                .agentId("dl-coder")
                 .compaction(CompactionConfig.builder().triggerMessages(40).keepMessages(15)
                         .flushBeforeCompact(true).build())
                 .toolResultEviction(ToolResultEvictionConfig.defaults()).toolkit(toolkit)
                 .maxIters(50).permissionContext(PermissionPolicy.buildPermissionContext(projectDir))
-                .stateStore(new JsonFileAgentStateStore()).workspace(workspace)
+                .stateStore(new JsonFileAgentStateStore(workspace)).workspace(workspace)
                 // 2.0.4 起框架默认把会话 transcript（相对 key <tenant>/<agentId>/<session>/events）
                 // 经 agent 文件系统上传，ProjectAwareOverlay 会把它当业务文件路由进项目目录；
                 // 显式钉到 workspace 下，与框架无文件系统时的回退布局一致

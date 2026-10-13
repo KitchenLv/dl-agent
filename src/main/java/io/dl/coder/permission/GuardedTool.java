@@ -5,6 +5,7 @@ import io.agentscope.core.permission.PermissionBehavior;
 import io.agentscope.core.permission.PermissionRule;
 import io.agentscope.core.tool.ToolBase;
 import io.agentscope.core.tool.ToolCallParam;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.function.Function;
@@ -23,7 +24,8 @@ import reactor.core.publisher.Mono;
  * <ul>
  * <li>{@link #matchRule}：ruleContent 视为正则（大小写不敏感），在调用参数文本（命令 / 路径）中查找；
  * 非法正则回退为字面量匹配
- * <li>{@link #generateSuggestions}："始终允许"的建议规则精确到本次命令 / 路径文本， 而不是放行整个工具
+ * <li>{@link #generateSuggestions}："始终允许"的建议规则仍为内容级——命令工具按程序名集合放宽
+ * （答一次 "a"，同程序组合的命令免问），文件工具精确到本次路径文本
  * </ul>
  *
  * <p>
@@ -34,16 +36,20 @@ public final class GuardedTool extends ToolBase {
 
     private final ToolBase delegate;
     private final Function<Map<String, Object>, String> contentExtractor;
+    private final boolean commandStyle;
 
     /**
      * @param delegate 被包装的原工具（保留同名注册，调用时整体委托）
      * @param contentExtractor 从调用入参提取待匹配文本（execute 取 command，文件工具取 path）
+     * @param commandStyle "a" 建议粒度：true=命令工具，按程序名集合放宽；false=精确到本次文本
      */
-    public GuardedTool(ToolBase delegate, Function<Map<String, Object>, String> contentExtractor) {
+    public GuardedTool(ToolBase delegate, Function<Map<String, Object>, String> contentExtractor,
+            boolean commandStyle) {
         super(delegate.getName(), delegate.getDescription(), delegate.getParameters(),
                 delegate.isReadOnly(), delegate.isConcurrencySafe(), false, null, false, false);
         this.delegate = delegate;
         this.contentExtractor = contentExtractor;
+        this.commandStyle = commandStyle;
     }
 
     @Override
@@ -69,7 +75,7 @@ public final class GuardedTool extends ToolBase {
         return compile(ruleContent).matcher(value).find();
     }
 
-    /** "始终允许"建议为内容级规则（精确到本次命令/路径文本）。 */
+    /** "始终允许"建议：命令工具按程序名集合，文件工具精确到本次路径文本。 */
     @Override
     public List<PermissionRule> generateSuggestions(Map<String, Object> toolInput) {
         String value = contentExtractor.apply(toolInput == null ? Map.of() : toolInput);
@@ -77,7 +83,42 @@ public final class GuardedTool extends ToolBase {
             return List.of(
                     new PermissionRule(getName(), null, PermissionBehavior.ALLOW, "suggested"));
         }
-        return List.of(new PermissionRule(getName(), value, PermissionBehavior.ALLOW, "suggested"));
+        String content = commandStyle ? programScopeRule(value) : value;
+        return List.of(new PermissionRule(getName(), content, PermissionBehavior.ALLOW, "suggested"));
+    }
+
+    /**
+     * 把命令文本收敛为"程序名集合"规则：按 {@code &&} / {@code ||} / {@code |} 切段取每段首个
+     * token，生成要求所有段头都在集合内的全串正则。同程序组合的后续命令免问；换程序或追加
+     * 未批准程序（如 {@code && git push}）不命中，回落默认 ASK。
+     */
+    private static String programScopeRule(String command) {
+        List<String> heads = new ArrayList<>();
+        for (String segment : command.split("&&|\\|\\||\\|")) {
+            String head = headToken(segment);
+            if (!head.isEmpty()) {
+                heads.add(Pattern.quote(head));
+            }
+        }
+        if (heads.isEmpty()) {
+            return command; // 切不出程序名，退回整条命令原文精确匹配
+        }
+        // "?…?" 容忍 "带空格路径" 的引号形式；\b 放在闭引号前保证词边界成立
+        return "^(?:\\s*\"?(?:" + String.join("|", heads) + ")\\b\"?[^\\n&|]*"
+                + "(?:\\s*(?:&&|\\|\\||\\|)\\s*)?)*$";
+    }
+
+    /** 段首程序名（兼容 "带空格路径" 的引号形式）；空段返回空串。 */
+    private static String headToken(String segment) {
+        String s = segment.strip();
+        if (s.isEmpty()) {
+            return "";
+        }
+        if (s.startsWith("\"")) {
+            int close = s.indexOf('"', 1);
+            return close > 1 ? s.substring(1, close) : s.substring(1);
+        }
+        return s.split("\\s+", 2)[0];
     }
 
     /** 非法正则（命令文本常含括号等元字符）回退为字面量。 */

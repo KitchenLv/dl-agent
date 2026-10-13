@@ -43,15 +43,15 @@ import java.util.stream.Stream;
  * 自动持久化并恢复各自的对话状态， 同会话串行、不同会话互不串扰。切换会话只是换一个 sessionId，无需重建 agent。
  *
  * <p>
- * 斜杠命令经注册表分发（{@link #register}）；{@code /model}、{@code /cd} 会重建 agent 实例—— 会话状态存在
- * stateStore 里按 (userId, sessionId) 恢复，重建不丢上下文。
+ * 斜杠命令经注册表分发（{@link #register}）；{@code /model}、{@code /cd} 会重建 agent 实例—— 会话状态存在 stateStore 里按
+ * (userId, sessionId) 恢复，重建不丢上下文。
  *
  * <p>
  * 用法：mvn exec:java -Dexec.mainClass=io.dl.coder.cli.CoderCli
  */
 public class CoderCli implements AutoCloseable {
 
-    private static final String USER_ID = "dev";
+    private static final String USER_ID = "dl";
     /** 单轮对话内人工确认的最大轮数，防确认-拒绝-再确认死循环。 */
     private static final int MAX_CONFIRM_ROUNDS = 20;
     /** /memory 展示 MEMORY.md 的尾部行数。 */
@@ -92,8 +92,7 @@ public class CoderCli implements AutoCloseable {
         // 如 Windows GBK 936）。不要强制 UTF-8：控制台仍是 GBK 时中文会乱码。
         // 想要完整 UTF-8 体验，可先执行 chcp 65001 再启动。
         this.out = System.out;
-        this.in = new BufferedReader(
-                new InputStreamReader(System.in, System.out.charset()));
+        this.in = new BufferedReader(new InputStreamReader(System.in, System.out.charset()));
         this.renderer = new ConsoleRenderer(this.out);
         this.sessions = SessionManager.createDefault();
         // eager id + lazy 注册：启动即生成随机 sessionId 供 RuntimeContext（/plan、/perm 等
@@ -116,7 +115,8 @@ public class CoderCli implements AutoCloseable {
         Path projectDir = Path.of(System.getProperty("user.dir")).toAbsolutePath().normalize();
         // 传入已加载的 config 与 projectDir：两参重载内部会再 load 一次，那份实例与
         // CLI 持有的 config 不是同一对象，两者会静默失同步
-        HarnessAgent agent = CoderAgentFactory.createAgent(workspace, new Toolkit(), config, projectDir);
+        HarnessAgent agent =
+                CoderAgentFactory.createAgent(workspace, new Toolkit(), config, projectDir);
         try (CoderCli cli = new CoderCli(agent, config.getMcp(), config, workspace, projectDir)) {
             cli.run();
         }
@@ -188,12 +188,10 @@ public class CoderCli implements AutoCloseable {
             printHelp();
             return true;
         });
-        register("/session", "/session [list|new|switch] 会话管理（new 可不带名字=随机名）",
-                this::session);
-        register("/init", "/init                        初始化项目 AGENTS.md（agent 分析项目生成）",
-                this::init);
+        register("/session", "/session [list|new|switch] 会话管理（new 可不带名字=随机名）", this::session);
+        register("/init", "/init                        初始化项目 AGENTS.md（agent 分析项目生成）", this::init);
         register("/plan", "/plan on|off|status         计划模式（只读调研 → 人确认 → 执行）", this::plan);
-        register("/perm", "/perm [mode]                权限模式（default|explore|accept-edits|dont-ask）",
+        register("/perm", "/perm [mode]                权限模式（default|explore|accept-edits|dont-ask|bypass）",
                 this::perm);
         register("/model", "/model [name]               查看/热切换模型（重建 agent，下一轮生效）", this::model);
         register("/cd", "/cd [path]                  查看/切换项目根（重建 agent，execute 的 cwd 跟随）",
@@ -206,11 +204,10 @@ public class CoderCli implements AutoCloseable {
                     : "MCP 服务器:\n" + mcp.summary());
             return true;
         });
-        register("/stats", "/stats                      本进程用量统计（含 token）",
-                args -> {
-                    out.println(renderer.stats());
-                    return true;
-                });
+        register("/stats", "/stats                      本进程用量统计（含 token）", args -> {
+            out.println(renderer.stats());
+            return true;
+        });
     }
 
     /** @return false 表示退出 REPL */
@@ -218,6 +215,13 @@ public class CoderCli implements AutoCloseable {
         String[] parts = input.split("\\s+");
         SlashCommand command = commands.get(parts[0].toLowerCase());
         if (command == null) {
+            // 未知命令兜底为技能名：/<skill-name> [参数] 显式执行技能（注册命令优先，不冲突）
+            String skillName = parts[0].substring(1);
+            Path skillFile = resolveSkillFile(skillName);
+            if (skillFile != null) {
+                return executeSkill(skillName, input.substring(parts[0].length()).strip(),
+                        skillFile);
+            }
             out.println("未知命令 " + parts[0] + "，/help 查看可用命令");
             return true;
         }
@@ -227,6 +231,7 @@ public class CoderCli implements AutoCloseable {
     private void printHelp() {
         out.println("命令:");
         helps.values().forEach(out::println);
+        out.println("技能: /<技能名> [参数]        直接执行技能（/skills 查看可用技能）");
     }
 
     // -----------------------------------------------------------------
@@ -277,16 +282,23 @@ public class CoderCli implements AutoCloseable {
     // HITL 人工确认（P0-1）
     // -----------------------------------------------------------------
 
-    /** 渲染待确认调用，收集 y/n/a 决策，组装携带 ConfirmResult 的恢复消息。 */
+    /** 渲染待确认调用，收集 y/n/a/all 决策，组装携带 ConfirmResult 的恢复消息。 */
     private UserMessage resumeWithConfirmResults(RequireUserConfirmEvent event) {
         List<ConfirmResult> results = new ArrayList<>();
         List<PermissionRule> acceptedRules = new ArrayList<>();
         List<ToolUseBlock> calls = event.getToolCalls();
+        boolean allowRest = false;
         for (int i = 0; i < calls.size(); i++) {
             ToolUseBlock call = calls.get(i);
             out.println("  ⏸ [" + (i + 1) + "/" + calls.size() + "] " + call.getName() + " "
                     + summarize(call.getInput()));
-            switch (askConfirm()) {
+            String answer = allowRest ? "y" : askConfirm();
+            if ("all".equals(answer)) {
+                allowRest = true;
+                answer = "y";
+                out.println("    → 本轮剩余调用全部允许（仅本次，不落规则）");
+            }
+            switch (answer) {
                 case "y" -> {
                     results.add(new ConfirmResult(true, call));
                     out.println("    → 本次允许");
@@ -312,8 +324,8 @@ public class CoderCli implements AutoCloseable {
     }
 
     /**
-     * 把 "a" 接受的规则写回会话的权限上下文。框架（2.0.2）每次调用都从 AgentState 重建
-     * PermissionEngine，ConfirmResult 里的规则只进当轮引擎实例；不写回 state 的话 下一轮同样的调用会再次询问。
+     * 把 "a" 接受的规则写回会话的权限上下文。框架（2.0.2）每次调用都从 AgentState 重建 PermissionEngine，ConfirmResult
+     * 里的规则只进当轮引擎实例；不写回 state 的话 下一轮同样的调用会再次询问。
      */
     private void persistAllowRules(List<PermissionRule> newRules) {
         if (newRules.isEmpty()) {
@@ -326,7 +338,8 @@ public class CoderCli implements AutoCloseable {
         current.getWorkingDirectories().forEach(b::addWorkingDirectory);
         current.getDenyRules().forEach((tool, rules) -> rules.forEach(r -> b.addDenyRule(tool, r)));
         current.getAskRules().forEach((tool, rules) -> rules.forEach(r -> b.addAskRule(tool, r)));
-        current.getAllowRules().forEach((tool, rules) -> rules.forEach(r -> b.addAllowRule(tool, r)));
+        current.getAllowRules()
+                .forEach((tool, rules) -> rules.forEach(r -> b.addAllowRule(tool, r)));
         for (PermissionRule rule : newRules) {
             boolean exists = current.getAllowRules().getOrDefault(rule.toolName(), List.of())
                     .stream().anyMatch(r -> sameContent(r, rule));
@@ -342,9 +355,9 @@ public class CoderCli implements AutoCloseable {
                 && Objects.equals(a.ruleContent(), b.ruleContent());
     }
 
-    /** 提示 y/n/a；回车与 Ctrl+D 视为拒绝。 */
+    /** 提示 y/n/a/all；回车与 Ctrl+D 视为拒绝。 */
     private String askConfirm() {
-        out.print("    允许? [y=允许 n=拒绝 a=始终允许]（回车=n）: ");
+        out.print("    允许? [y=允许 n=拒绝 a=始终允许 all=剩余全允许]（回车=n）: ");
         out.flush();
         String line;
         try {
@@ -359,13 +372,14 @@ public class CoderCli implements AutoCloseable {
             case "", "n", "no" -> "n";
             case "y", "yes" -> "y";
             case "a", "always" -> "a";
+            case "all" -> "all";
             default -> "n"; // 无法识别的输入按拒绝处理，宁可保守
         };
     }
 
     /**
-     * "始终允许"的规则：优先取工具自己的建议（GuardedTool 会精确到本次命令/路径文本， 避免一条 "a"
-     * 放行整个工具），查不到工具时退化为工具级放行。
+     * "始终允许"的规则：优先取工具自己的建议（GuardedTool：命令工具按程序名集合、文件工具精确到
+     * 本次路径，避免一条 "a" 放行整个工具），查不到工具时退化为工具级放行。
      */
     private List<PermissionRule> alwaysAllowRules(ToolUseBlock call) {
         AgentTool tool = agent.getToolkit().getTool(call.getName());
@@ -373,8 +387,8 @@ public class CoderCli implements AutoCloseable {
         if (tool instanceof ToolBase base) {
             return base.generateSuggestions(input);
         }
-        return List.of(new PermissionRule(call.getName(), null, PermissionBehavior.ALLOW,
-                "suggested"));
+        return List.of(
+                new PermissionRule(call.getName(), null, PermissionBehavior.ALLOW, "suggested"));
     }
 
     /** 调用参数的单行摘要（截断）。 */
@@ -391,9 +405,9 @@ public class CoderCli implements AutoCloseable {
         RuntimeContext ctx = currentContext();
         if (parts.length == 1) {
             boolean started = sessions.exists(currentSession);
-            out.println("当前会话: " + (started ? currentSession : "（未开始，首条消息后将创建 "
-                    + currentSession + "）") + "（plan mode: "
-                    + (agent.isPlanModeActive(ctx) ? "开" : "关") + "）");
+            out.println(
+                    "当前会话: " + (started ? currentSession : "（未开始，首条消息后将创建 " + currentSession + "）")
+                            + "（plan mode: " + (agent.isPlanModeActive(ctx) ? "开" : "关") + "）");
             return true;
         }
         switch (parts[1]) {
@@ -405,8 +419,8 @@ public class CoderCli implements AutoCloseable {
             }
             case "new" -> {
                 // 无参 = 随机名；带参 = 指定名。均为显式创建，立即注册
-                String name = parts.length >= 3 && !parts[2].isBlank() ? parts[2]
-                        : sessions.randomName();
+                String name =
+                        parts.length >= 3 && !parts[2].isBlank() ? parts[2] : sessions.randomName();
                 sessions.register(name);
                 currentSession = name;
                 out.println("已新建并切换到会话: " + currentSession);
@@ -445,7 +459,7 @@ public class CoderCli implements AutoCloseable {
     private boolean perm(String[] parts) {
         if (parts.length < 2) {
             out.println("当前权限模式: " + agent.getPermissionMode(USER_ID, currentSession));
-            out.println("可选: default | explore | accept-edits | dont-ask");
+            out.println("可选: default | explore | accept-edits | dont-ask | bypass");
             return true;
         }
         PermissionMode mode = switch (parts[1]) {
@@ -453,14 +467,18 @@ public class CoderCli implements AutoCloseable {
             case "explore" -> PermissionMode.EXPLORE;
             case "accept-edits" -> PermissionMode.ACCEPT_EDITS;
             case "dont-ask" -> PermissionMode.DONT_ASK;
+            case "bypass" -> PermissionMode.BYPASS;
             default -> null;
         };
         if (mode == null) {
-            out.println("未知模式: " + parts[1] + "（可选 default | explore | accept-edits | dont-ask）");
+            out.println("未知模式: " + parts[1] + "（可选 default | explore | accept-edits | dont-ask | bypass）");
             return true;
         }
         agent.setPermissionMode(currentContext(), mode);
         out.println("权限模式已切换: " + parts[1]);
+        if (mode == PermissionMode.BYPASS) {
+            out.println("（bypass 仅把默认档改为放行；no-secrets DENY 与危险命令 ASK 规则仍然生效）");
+        }
         return true;
     }
 
@@ -566,6 +584,7 @@ public class CoderCli implements AutoCloseable {
         }
         personal.forEach(name -> out.println("  (个人) " + name));
         project.forEach(name -> out.println("  (项目) " + name));
+        out.println("提示: 输入 /<技能名> [参数] 可直接执行技能");
         return true;
     }
 
@@ -575,13 +594,64 @@ public class CoderCli implements AutoCloseable {
             return List.of();
         }
         try (Stream<Path> entries = Files.list(dir)) {
-            return entries.filter(Files::isDirectory)
-                    .map(p -> p.getFileName().toString())
-                    .sorted()
+            return entries.filter(Files::isDirectory).map(p -> p.getFileName().toString()).sorted()
                     .collect(Collectors.toList());
         } catch (IOException e) {
             return List.of();
         }
+    }
+
+    /**
+     * 按名字解析技能的 SKILL.md：项目 .dl-coder/skills 优先于个人 workspace/skills， 找不到时忽略大小写再扫一遍。未命中返回
+     * null。
+     */
+    private Path resolveSkillFile(String name) {
+        for (Path root : List.of(projectDir.resolve(".dl-coder").resolve("skills"),
+                workspace.resolve("skills"))) {
+            Path exact = root.resolve(name).resolve("SKILL.md");
+            if (Files.isRegularFile(exact)) {
+                return exact;
+            }
+            Path loose = skillFileIgnoreCase(root, name);
+            if (loose != null) {
+                return loose;
+            }
+        }
+        return null;
+    }
+
+    /** 在技能根目录下忽略大小写匹配技能子目录，返回其 SKILL.md（无匹配返回 null）。 */
+    private static Path skillFileIgnoreCase(Path root, String name) {
+        if (!Files.isDirectory(root)) {
+            return null;
+        }
+        try (Stream<Path> entries = Files.list(root)) {
+            return entries.filter(Files::isDirectory)
+                    .filter(p -> p.getFileName().toString().equalsIgnoreCase(name))
+                    .map(p -> p.resolve("SKILL.md")).filter(Files::isRegularFile).findFirst()
+                    .orElse(null);
+        } catch (IOException e) {
+            return null;
+        }
+    }
+
+    /**
+     * /&lt;skill-name&gt;：显式执行技能——把 SKILL.md 内容注入 prompt 走普通对话管线， 模型按技能说明自行使用工具完成任务。
+     */
+    private boolean executeSkill(String name, String args, Path skillFile) {
+        String content;
+        try {
+            content = Files.readString(skillFile);
+        } catch (IOException e) {
+            out.println("读取技能失败: " + e.getMessage());
+            return true;
+        }
+        out.println("执行技能: " + name + (args.isEmpty() ? "" : "（参数: " + args + "）"));
+        String prompt = "用户通过 /" + name + " 显式调用技能，请严格按下方技能说明执行"
+                + (args.isEmpty() ? "。" : "，用户参数：" + args)
+                + "\n\n<skill name=\"" + name + "\">\n" + content + "\n</skill>";
+        chat(prompt);
+        return true;
     }
 
     // -----------------------------------------------------------------
@@ -589,9 +659,9 @@ public class CoderCli implements AutoCloseable {
     // -----------------------------------------------------------------
 
     /**
-     * 按当前配置与项目根重建 agent（/model、/cd 用）。 先关旧再建新——先建后关会让两个 agent 短暂同时
-     * 持有同一 (userId, sessionId) 的状态文件锁、并重复拉起 MCP stdio 进程（锁被占用会让新回合挂起）。
-     * 会话状态在 stateStore，不受实例销毁影响；重建失败时 agent 为 null，调用方负责回滚自己的状态。
+     * 按当前配置与项目根重建 agent（/model、/cd 用）。 先关旧再建新——先建后关会让两个 agent 短暂同时 持有同一 (userId, sessionId)
+     * 的状态文件锁、并重复拉起 MCP stdio 进程（锁被占用会让新回合挂起）。 会话状态在 stateStore，不受实例销毁影响；重建失败时 agent 为
+     * null，调用方负责回滚自己的状态。
      */
     private void rebuildAgent() {
         if (agent != null) {

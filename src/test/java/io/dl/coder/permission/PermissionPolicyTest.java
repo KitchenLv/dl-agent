@@ -10,6 +10,7 @@ import io.agentscope.core.permission.PermissionBehavior;
 import io.agentscope.core.permission.PermissionContextState;
 import io.agentscope.core.permission.PermissionDecision;
 import io.agentscope.core.permission.PermissionEngine;
+import io.agentscope.core.permission.PermissionMode;
 import io.agentscope.core.permission.PermissionRule;
 import io.agentscope.core.tool.ToolBase;
 import io.agentscope.core.tool.ToolCallParam;
@@ -92,16 +93,50 @@ class PermissionPolicyTest {
     }
 
     @Test
-    void 始终允许建议精确到命令文本() {
-        GuardedTool execute = guardedExecute();
-        List<PermissionRule> rules = execute.generateSuggestions(Map.of("command", "mvn -q compile"));
+    void bypass模式默认放行但Deny与Ask规则仍生效() {
+        PermissionEngine engine = new PermissionEngine(
+                PermissionPolicy.buildPermissionContext(Path.of(".").toAbsolutePath().normalize())
+                        .withMode(PermissionMode.BYPASS));
+        // 普通命令默认放行（不再 ASK）
+        assertEquals(PermissionBehavior.ALLOW,
+                decide(engine, "execute", Map.of("command", "javap -cp a.jar io.Foo")));
+        // 危险命令 ASK 与敏感文件 DENY 在 bypass 之前评估，仍然拦截
+        assertEquals(PermissionBehavior.ASK,
+                decide(engine, "execute", Map.of("command", "git push origin main")));
+        assertEquals(PermissionBehavior.DENY, decide(engine, "read_file", Map.of("path", "config/.env")));
+    }
+
+    @Test
+    void 始终允许建议_文件工具精确到路径文本() {
+        GuardedTool readFile = guardedReadFile();
+        List<PermissionRule> rules = readFile.generateSuggestions(Map.of("path", "src/A.java"));
         assertEquals(1, rules.size());
-        assertEquals("execute", rules.get(0).toolName());
-        assertEquals("mvn -q compile", rules.get(0).ruleContent());
+        assertEquals("read_file", rules.get(0).toolName());
+        assertEquals("src/A.java", rules.get(0).ruleContent());
         assertEquals(PermissionBehavior.ALLOW, rules.get(0).behavior());
-        // 建议按内容级规则回匹配：同命令命中，不同命令不命中
-        assertTrue(execute.matchRule(rules.get(0).ruleContent(), Map.of("command", "mvn -q compile")));
-        assertFalse(execute.matchRule(rules.get(0).ruleContent(), Map.of("command", "rm -rf /")));
+    }
+
+    @Test
+    void 始终允许建议_命令工具放宽到程序名集合() {
+        GuardedTool execute = guardedExecute();
+        PermissionRule rule = execute.generateSuggestions(
+                Map.of("command", "cd /d D:\\sobey\\lib && javap -cp a.jar io.Foo")).get(0);
+        assertEquals("execute", rule.toolName());
+        assertEquals(PermissionBehavior.ALLOW, rule.behavior());
+        // 同程序组合（参数不同）免问
+        assertTrue(execute.matchRule(rule.ruleContent(),
+                Map.of("command", "cd /d D:\\other && javap -cp b.jar io.Bar")));
+        assertTrue(execute.matchRule(rule.ruleContent(), Map.of("command", "javap -cp a.jar io.Foo")));
+        // 换程序 / 追加未批准程序 / 危险命令不命中，回落默认 ASK
+        assertFalse(execute.matchRule(rule.ruleContent(), Map.of("command", "mvn -q compile")));
+        assertFalse(execute.matchRule(rule.ruleContent(), Map.of("command", "cd /d X && git push")));
+        assertFalse(execute.matchRule(rule.ruleContent(), Map.of("command", "rm -rf /")));
+        // 引号形式的带空格路径程序名
+        PermissionRule quoted = execute.generateSuggestions(
+                Map.of("command", "\"C:\\Program Files\\JDK\\bin\\javap\" -verbose io.Foo")).get(0);
+        assertTrue(execute.matchRule(quoted.ruleContent(),
+                Map.of("command", "\"C:\\Program Files\\JDK\\bin\\javap\" io.Bar")));
+        assertFalse(execute.matchRule(quoted.ruleContent(), Map.of("command", "javap io.Bar")));
     }
 
     @Test
@@ -147,18 +182,19 @@ class PermissionPolicyTest {
         // 引擎评估的是包装后的工具（matchRule 语义），与 agent 内真实路径一致
         ToolBase wrapped = "execute".equals(tool) ? guardedExecute() : guardedReadFile();
         if (!tool.equals(wrapped.getName())) {
-            wrapped = new GuardedTool(new FakeTool(tool, true, "path"), in -> str(in.get("path")));
+            wrapped = new GuardedTool(new FakeTool(tool, true, "path"), in -> str(in.get("path")), false);
         }
         PermissionDecision decision = engine.checkPermission(wrapped, input).block();
         return decision == null ? null : decision.getBehavior();
     }
 
     private static GuardedTool guardedExecute() {
-        return new GuardedTool(new FakeTool("execute", false, "command"), in -> str(in.get("command")));
+        return new GuardedTool(new FakeTool("execute", false, "command"),
+                in -> str(in.get("command")), true);
     }
 
     private static GuardedTool guardedReadFile() {
-        return new GuardedTool(new FakeTool("read_file", true, "path"), in -> str(in.get("path")));
+        return new GuardedTool(new FakeTool("read_file", true, "path"), in -> str(in.get("path")), false);
     }
 
     private static String str(Object value) {

@@ -1,4 +1,4 @@
-# DL Coder（dl-agent）
+# DL Coder（dl-coder）
 
 跑在开发者本机的命令行 Coding Agent——基于 [AgentScope-Java 2.x](https://github.com/agentscope-ai/agentscope-java)（`agentscope-harness`），对标 Claude Code 的端侧形态：REPL、文件/命令工具、会话持久化、计划模式、权限系统（y/n/a 人工确认）、MCP 工具接入。纯单机，无分布式组件。
 
